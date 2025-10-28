@@ -595,12 +595,127 @@ app.get('/api/auth/google/callback',
         { expiresIn: '30d' }
       );
 
-      // Redirect to app with token
+      // Create deep link URL
       const redirectUrl = `tikhub://oauth-success?token=${token}&username=${encodeURIComponent(req.user.username)}&email=${encodeURIComponent(req.user.email)}&tier=${subscription.tier}`;
-      res.redirect(redirectUrl);
+      
+      // Serve HTML page that redirects and auto-closes
+      res.send(`
+        <!DOCTYPE html>
+        <html>
+          <head>
+            <title>TikHub - Login Successful</title>
+            <style>
+              body {
+                margin: 0;
+                padding: 0;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                height: 100vh;
+                color: white;
+              }
+              .container {
+                text-align: center;
+                padding: 40px;
+                background: rgba(255, 255, 255, 0.1);
+                border-radius: 20px;
+                backdrop-filter: blur(10px);
+                box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+              }
+              .checkmark {
+                font-size: 64px;
+                animation: scale 0.5s ease-in-out;
+              }
+              @keyframes scale {
+                0% { transform: scale(0); }
+                50% { transform: scale(1.2); }
+                100% { transform: scale(1); }
+              }
+              h1 {
+                font-size: 28px;
+                margin: 20px 0 10px;
+              }
+              p {
+                font-size: 16px;
+                opacity: 0.9;
+              }
+            </style>
+          </head>
+          <body>
+            <div class="container">
+              <div class="checkmark">✅</div>
+              <h1>Login Successful!</h1>
+              <p>Redirecting to TikHub app...</p>
+              <p style="font-size: 14px; margin-top: 20px; opacity: 0.7;">This window will close automatically.</p>
+            </div>
+            <script>
+              // Redirect to app
+              window.location.href = '${redirectUrl}';
+              
+              // Close window after short delay
+              setTimeout(() => {
+                window.close();
+                
+                // If window.close() doesn't work (some browsers block it), show manual close message
+                setTimeout(() => {
+                  if (!window.closed) {
+                    document.body.innerHTML = \`
+                      <div class="container">
+                        <div class="checkmark">✅</div>
+                        <h1>Login Successful!</h1>
+                        <p>You can now close this tab and return to TikHub.</p>
+                      </div>
+                    \`;
+                  }
+                }, 500);
+              }, 1000);
+            </script>
+          </body>
+        </html>
+      `);
     } catch (error) {
       console.error('❌ Google OAuth callback error:', error);
-      res.redirect('tikhub://oauth-error?error=callback_failed');
+      res.send(`
+        <!DOCTYPE html>
+        <html>
+          <head>
+            <title>TikHub - Login Failed</title>
+            <style>
+              body {
+                margin: 0;
+                padding: 0;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+                background: linear-gradient(135deg, #f54ea2 0%, #ff7676 100%);
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                height: 100vh;
+                color: white;
+              }
+              .container {
+                text-align: center;
+                padding: 40px;
+                background: rgba(255, 255, 255, 0.1);
+                border-radius: 20px;
+                backdrop-filter: blur(10px);
+                box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+              }
+            </style>
+          </head>
+          <body>
+            <div class="container">
+              <div style="font-size: 64px;">❌</div>
+              <h1>Login Failed</h1>
+              <p>Please try again or contact support.</p>
+            </div>
+            <script>
+              setTimeout(() => window.close(), 3000);
+            </script>
+          </body>
+        </html>
+      `);
     }
   }
 );
@@ -637,19 +752,209 @@ app.get('/api/auth/discord/callback',
         { expiresIn: '30d' }
       );
 
-      // Redirect to app with token
+      // Create deep link URL
       const redirectUrl = `tikhub://oauth-success?token=${token}&username=${encodeURIComponent(req.user.username)}&email=${encodeURIComponent(req.user.email)}&tier=${subscription.tier}`;
-      res.redirect(redirectUrl);
+      
+      // Serve HTML page that redirects and auto-closes
+      res.send(`
+        <!DOCTYPE html>
+        <html>
+          <head>
+            <title>TikHub - Login Successful</title>
+            <style>
+              body {
+                margin: 0;
+                padding: 0;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                height: 100vh;
+                color: white;
+              }
+              .container {
+                text-align: center;
+                padding: 40px;
+                background: rgba(255, 255, 255, 0.1);
+                border-radius: 20px;
+                backdrop-filter: blur(10px);
+                box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+              }
+              .checkmark {
+                font-size: 64px;
+                animation: scale 0.5s ease-in-out;
+              }
+              @keyframes scale {
+                0% { transform: scale(0); }
+                50% { transform: scale(1.2); }
+                100% { transform: scale(1); }
+              }
+              h1 {
+                font-size: 28px;
+                margin: 20px 0 10px;
+              }
+              p {
+                font-size: 16px;
+                opacity: 0.9;
+              }
+            </style>
+          </head>
+          <body>
+            <div class="container">
+              <div class="checkmark">✅</div>
+              <h1>Login Successful!</h1>
+              <p>Redirecting to TikHub app...</p>
+              <p style="font-size: 14px; margin-top: 20px; opacity: 0.7;">This window will close automatically.</p>
+            </div>
+            <script>
+              // Redirect to app
+              window.location.href = '${redirectUrl}';
+              
+              // Close window after short delay
+              setTimeout(() => {
+                window.close();
+                
+                // If window.close() doesn't work (some browsers block it), show manual close message
+                setTimeout(() => {
+                  if (!window.closed) {
+                    document.body.innerHTML = \`
+                      <div class="container">
+                        <div class="checkmark">✅</div>
+                        <h1>Login Successful!</h1>
+                        <p>You can now close this tab and return to TikHub.</p>
+                      </div>
+                    \`;
+                  }
+                }, 500);
+              }, 1000);
+            </script>
+          </body>
+        </html>
+      `);
     } catch (error) {
       console.error('❌ Discord OAuth callback error:', error);
-      res.redirect('tikhub://oauth-error?error=callback_failed');
+      res.send(`
+        <!DOCTYPE html>
+        <html>
+          <head>
+            <title>TikHub - Login Failed</title>
+            <style>
+              body {
+                margin: 0;
+                padding: 0;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+                background: linear-gradient(135deg, #f54ea2 0%, #ff7676 100%);
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                height: 100vh;
+                color: white;
+              }
+              .container {
+                text-align: center;
+                padding: 40px;
+                background: rgba(255, 255, 255, 0.1);
+                border-radius: 20px;
+                backdrop-filter: blur(10px);
+                box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+              }
+            </style>
+          </head>
+          <body>
+            <div class="container">
+              <div style="font-size: 64px;">❌</div>
+              <h1>Login Failed</h1>
+              <p>Please try again or contact support.</p>
+            </div>
+            <script>
+              setTimeout(() => window.close(), 3000);
+            </script>
+          </body>
+        </html>
+      `);
     }
   }
 );
 
 // OAuth Error Handler
 app.get('/api/auth/oauth-error', (req, res) => {
-  res.redirect('tikhub://oauth-error?error=authentication_failed');
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <title>TikHub - Login Failed</title>
+        <style>
+          body {
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+            background: linear-gradient(135deg, #f54ea2 0%, #ff7676 100%);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            color: white;
+          }
+          .container {
+            text-align: center;
+            padding: 40px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 20px;
+            backdrop-filter: blur(10px);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+          }
+          .icon {
+            font-size: 64px;
+            animation: shake 0.5s ease-in-out;
+          }
+          @keyframes shake {
+            0%, 100% { transform: translateX(0); }
+            25% { transform: translateX(-10px); }
+            75% { transform: translateX(10px); }
+          }
+          h1 {
+            font-size: 28px;
+            margin: 20px 0 10px;
+          }
+          p {
+            font-size: 16px;
+            opacity: 0.9;
+          }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="icon">❌</div>
+          <h1>Authentication Failed</h1>
+          <p>Unable to complete login. Please try again.</p>
+          <p style="font-size: 14px; margin-top: 20px; opacity: 0.7;">This window will close automatically.</p>
+        </div>
+        <script>
+          // Redirect to app with error
+          window.location.href = 'tikhub://oauth-error?error=authentication_failed';
+          
+          // Close window after delay
+          setTimeout(() => {
+            window.close();
+            
+            // If window.close() doesn't work, show manual close message
+            setTimeout(() => {
+              if (!window.closed) {
+                document.body.innerHTML = \`
+                  <div class="container">
+                    <div class="icon">❌</div>
+                    <h1>Authentication Failed</h1>
+                    <p>You can now close this tab and try again in TikHub.</p>
+                  </div>
+                \`;
+              }
+            }, 500);
+          }, 2000);
+        </script>
+      </body>
+    </html>
+  `);
 });
 
 // User registration
