@@ -344,7 +344,8 @@ app.get('/api/subscription/status', authenticateToken, async (req, res) => {
           tier: 'free',
           status: 'active',
           startDate: new Date().toISOString(),
-          endDate: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString()
+          endDate: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString(),
+          autoRenew: false
         }
       });
     }
@@ -376,7 +377,16 @@ app.get('/api/subscription/status', authenticateToken, async (req, res) => {
       }
     }
 
-    res.json({ subscription: subscription });
+    // Convert snake_case to camelCase for frontend compatibility
+    const formattedSubscription = {
+      tier: subscription.tier,
+      status: subscription.status,
+      startDate: subscription.start_date ? new Date(subscription.start_date).toISOString() : new Date().toISOString(),
+      endDate: subscription.end_date ? new Date(subscription.end_date).toISOString() : new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString(),
+      autoRenew: subscription.auto_renew || false
+    };
+
+    res.json({ subscription: formattedSubscription });
   } catch (error) {
     console.error('Error fetching subscription:', error);
     res.status(500).json({ error: 'Failed to fetch subscription' });
