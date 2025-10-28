@@ -1,57 +1,13 @@
 services:
-  # PostgreSQL Database
-  - type: pserv
-    name: tikhub-database
-    databaseName: tikhub_db
-    databaseUser: tikhub_user
-    plan: free
-
-  # Web Service (API)
+  # Web Service (Cloud API)
   - type: web
     name: tikhub-cloud-api
     runtime: node
     plan: free
     buildCommand: npm install
-    startCommand: npm start
+    startCommand: node server.js
     envVars:
-      - key: DATABASE_URL
-        fromDatabase:
-          name: tikhub-database
-          property: connectionString
-      - key: JWT_SECRET
-        generateValue: true
-      - key: ADMIN_SECRET
-        generateValue: true
-    autoDeploy: false
-
-
-
-
-  # PostgreSQL Database
-  - type: pserv
-    name: tikhub-database
-    databaseName: tikhub_db
-    databaseUser: tikhub_user
-    plan: free
-
-  # Web Service (API)
-  - type: web
-    name: tikhub-cloud-api
-    runtime: node
-    plan: free
-    buildCommand: npm install
-    startCommand: npm start
-    envVars:
-      - key: DATABASE_URL
-        fromDatabase:
-          name: tikhub-database
-          property: connectionString
-      - key: JWT_SECRET
-        generateValue: true
-      - key: ADMIN_SECRET
-        generateValue: true
-    autoDeploy: false
-
-
-
-
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
