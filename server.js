@@ -271,6 +271,89 @@ const authenticateAdmin = (req, res, next) => {
   next();
 };
 
+// TikHub Client Validation Middleware
+const validateTikHubClient = (req, res, next) => {
+  const clientSignature = req.headers['x-tikhub-client'];
+  const clientVersion = req.headers['x-tikhub-version'];
+  const requestTime = req.headers['x-request-time'];
+  
+  // Skip validation for admin endpoints
+  if (req.path.includes('/admin/')) {
+    return next();
+  }
+  
+  // Check if headers are present
+  if (!clientSignature || !clientVersion || !requestTime) {
+    console.log('[Security] Missing TikHub client headers:', {
+      hasSignature: !!clientSignature,
+      hasVersion: !!clientVersion,
+      hasTime: !!requestTime,
+      path: req.path
+    });
+    return res.status(403).json({ 
+      error: 'Unauthorized client. Please use the official TikHub app.' 
+    });
+  }
+  
+  // Check if request is not too old (prevent replay attacks)
+  const now = Date.now();
+  const reqTime = parseInt(requestTime);
+  const maxAge = 5 * 60 * 1000; // 5 minutes
+  
+  if (isNaN(reqTime) || now - reqTime > maxAge) {
+    console.log('[Security] Request too old or invalid timestamp:', {
+      now,
+      reqTime,
+      diff: now - reqTime,
+      maxAge
+    });
+    return res.status(403).json({ 
+      error: 'Request expired. Please try again.' 
+    });
+  }
+  
+  // Validate signature (simple hash validation)
+  const APP_SECRET = 'TikHub_v1.0_SecureClient_2024';
+  const signatureString = `${APP_SECRET}:${requestTime}:${clientVersion}`;
+  
+  // Simple hash function (same as client-side)
+  function simpleHash(str) {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      const char = str.charCodeAt(i);
+      hash = ((hash << 5) - hash) + char;
+      hash = hash & hash; // Convert to 32bit integer
+    }
+    return Math.abs(hash).toString(36);
+  }
+  
+  const expectedSignature = simpleHash(signatureString);
+  
+  if (clientSignature !== expectedSignature) {
+    console.log('[Security] Invalid client signature:', {
+      received: clientSignature,
+      expected: expectedSignature,
+      path: req.path
+    });
+    return res.status(403).json({ 
+      error: 'Invalid client signature. Please use the official TikHub app.' 
+    });
+  }
+  
+  // All checks passed
+  next();
+};
+
+// Apply TikHub client validation to all API routes (except public ones)
+app.use('/api/', (req, res, next) => {
+  // Skip validation for public endpoints
+  const publicPaths = ['/api/health', '/api/status', '/api/'];
+  if (publicPaths.includes(req.path)) {
+    return next();
+  }
+  validateTikHubClient(req, res, next);
+});
+
 // ==================== PUBLIC ENDPOINTS ====================
 
 // Root endpoint - Welcome page
@@ -1191,10 +1274,10 @@ app.get('/api/admin/users', authenticateAdmin, async (req, res) => {
     // Build dynamic query
     let query = `
       SELECT u.id, u.username, u.email, u.created_at, u.last_login, u.last_activity,
-             u.device_info, u.is_active,
-             s.tier, s.status, s.start_date, s.end_date, s.auto_renew, s.admin_notes
-      FROM users u
-      LEFT JOIN subscriptions s ON u.id = s.user_id
+              u.device_info, u.is_active,
+              s.tier, s.status, s.start_date, s.end_date, s.auto_renew, s.admin_notes
+       FROM users u
+       LEFT JOIN subscriptions s ON u.id = s.user_id
       WHERE 1=1
     `;
     
@@ -1597,7 +1680,7 @@ app.post('/api/admin/generate-reset-token', authenticateAdmin, async (req, res) 
     expiresAt.setHours(expiresAt.getHours() + 1);
 
     // Save token to database
-    await pool.query(
+        await pool.query(
       'INSERT INTO password_reset_tokens (user_id, token, expires_at, created_by) VALUES ($1, $2, $3, $4)',
       [user.id, token, expiresAt, 'admin']
     );
@@ -1676,7 +1759,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
     const hashedPassword = await bcrypt.hash(newPassword, 10);
 
     // Update user's password
-    await pool.query(
+        await pool.query(
       'UPDATE users SET password_hash = $1 WHERE id = $2',
       [hashedPassword, decoded.userId]
     );
@@ -1725,7 +1808,7 @@ app.post('/api/presets/save', authenticateToken, async (req, res) => {
 
       // Insert new presets
       for (const preset of presets) {
-        await pool.query(
+    await pool.query(
           `INSERT INTO user_presets (user_id, minigame_key, preset_id, preset_name, triggers, updated_at)
            VALUES ($1, $2, $3, $4, $5, NOW())`,
           [userId, minigameKey, preset.id, preset.name, JSON.stringify(preset.triggers)]
@@ -1736,12 +1819,12 @@ app.post('/api/presets/save', authenticateToken, async (req, res) => {
 
       console.log(`✅ Saved ${presets.length} presets for ${minigameKey}`);
 
-      res.json({
-        success: true,
+    res.json({
+      success: true,
         message: `Saved ${presets.length} presets successfully`,
         count: presets.length
-      });
-    } catch (error) {
+    });
+  } catch (error) {
       await pool.query('ROLLBACK');
       throw error;
     }
@@ -1799,8 +1882,8 @@ app.get('/api/presets/load-all', authenticateToken, async (req, res) => {
        FROM user_presets 
        WHERE user_id = $1 
        ORDER BY minigame_key, preset_id`,
-      [userId]
-    );
+        [userId]
+      );
 
     // Group by minigame
     const presetsByGame = {};
@@ -1901,4 +1984,5 @@ app.listen(PORT, () => {
 process.on('unhandledRejection', (err) => {
   console.error('❌ Unhandled Promise Rejection:', err);
 });
+
 
