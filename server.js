@@ -1527,11 +1527,27 @@ app.post('/api/admin/init-db', authenticateAdmin, async (req, res) => {
       )
     `);
 
+    // Create user_presets table for cloud sync
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_presets (
+        id SERIAL PRIMARY KEY,
+        user_id VARCHAR(255) REFERENCES users(id) ON DELETE CASCADE,
+        minigame_key VARCHAR(50) NOT NULL,
+        preset_id VARCHAR(50) NOT NULL,
+        preset_name VARCHAR(100) NOT NULL,
+        triggers JSONB NOT NULL DEFAULT '[]',
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(user_id, minigame_key, preset_id)
+      )
+    `);
+
     // Create indexes
     await pool.query('CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)');
     await pool.query('CREATE INDEX IF NOT EXISTS idx_subscription_updates_user ON subscription_updates(user_id, status)');
     await pool.query('CREATE INDEX IF NOT EXISTS idx_reset_tokens_token ON password_reset_tokens(token)');
     await pool.query('CREATE INDEX IF NOT EXISTS idx_reset_tokens_user ON password_reset_tokens(user_id)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_user_presets_user_game ON user_presets(user_id, minigame_key)');
 
     console.log('✅ Database tables created successfully');
 
@@ -1680,6 +1696,195 @@ app.post('/api/auth/reset-password', async (req, res) => {
   } catch (error) {
     console.error('❌ Error resetting password:', error);
     res.status(500).json({ error: 'Failed to reset password' });
+  }
+});
+
+// ==================== PRESET SYNC ENDPOINTS ====================
+
+// Save all presets for a specific game (replaces all presets for that game)
+app.post('/api/presets/save', authenticateToken, async (req, res) => {
+  try {
+    const { minigameKey, presets } = req.body;
+    const userId = req.user.userId;
+
+    if (!minigameKey || !presets || !Array.isArray(presets)) {
+      return res.status(400).json({ error: 'Invalid request. minigameKey and presets array required' });
+    }
+
+    console.log(`💾 Saving ${presets.length} presets for user ${userId}, game: ${minigameKey}`);
+
+    // Begin transaction
+    await pool.query('BEGIN');
+
+    try {
+      // Delete existing presets for this game
+      await pool.query(
+        'DELETE FROM user_presets WHERE user_id = $1 AND minigame_key = $2',
+        [userId, minigameKey]
+      );
+
+      // Insert new presets
+      for (const preset of presets) {
+        await pool.query(
+          `INSERT INTO user_presets (user_id, minigame_key, preset_id, preset_name, triggers, updated_at)
+           VALUES ($1, $2, $3, $4, $5, NOW())`,
+          [userId, minigameKey, preset.id, preset.name, JSON.stringify(preset.triggers)]
+        );
+      }
+
+      await pool.query('COMMIT');
+
+      console.log(`✅ Saved ${presets.length} presets for ${minigameKey}`);
+
+      res.json({
+        success: true,
+        message: `Saved ${presets.length} presets successfully`,
+        count: presets.length
+      });
+    } catch (error) {
+      await pool.query('ROLLBACK');
+      throw error;
+    }
+  } catch (error) {
+    console.error('Error saving presets:', error);
+    res.status(500).json({ error: 'Failed to save presets' });
+  }
+});
+
+// Load all presets for a specific game
+app.get('/api/presets/load/:minigameKey', authenticateToken, async (req, res) => {
+  try {
+    const { minigameKey } = req.params;
+    const userId = req.user.userId;
+
+    console.log(`📥 Loading presets for user ${userId}, game: ${minigameKey}`);
+
+    const result = await pool.query(
+      `SELECT preset_id, preset_name, triggers, updated_at 
+       FROM user_presets 
+       WHERE user_id = $1 AND minigame_key = $2 
+       ORDER BY preset_id`,
+      [userId, minigameKey]
+    );
+
+    const presets = result.rows.map(row => ({
+      id: row.preset_id,
+      name: row.preset_name,
+      triggers: row.triggers,
+      updatedAt: row.updated_at
+    }));
+
+    console.log(`✅ Loaded ${presets.length} presets for ${minigameKey}`);
+
+    res.json({
+      success: true,
+      presets,
+      count: presets.length
+    });
+  } catch (error) {
+    console.error('Error loading presets:', error);
+    res.status(500).json({ error: 'Failed to load presets' });
+  }
+});
+
+// Load all presets for all games (for initial sync on login)
+app.get('/api/presets/load-all', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+
+    console.log(`📥 Loading all presets for user ${userId}`);
+
+    const result = await pool.query(
+      `SELECT minigame_key, preset_id, preset_name, triggers, updated_at 
+       FROM user_presets 
+       WHERE user_id = $1 
+       ORDER BY minigame_key, preset_id`,
+      [userId]
+    );
+
+    // Group by minigame
+    const presetsByGame = {};
+    result.rows.forEach(row => {
+      if (!presetsByGame[row.minigame_key]) {
+        presetsByGame[row.minigame_key] = [];
+      }
+      presetsByGame[row.minigame_key].push({
+        id: row.preset_id,
+        name: row.preset_name,
+        triggers: row.triggers,
+        updatedAt: row.updated_at
+      });
+    });
+
+    console.log(`✅ Loaded presets for ${Object.keys(presetsByGame).length} games`);
+
+    res.json({
+      success: true,
+      presets: presetsByGame,
+      totalGames: Object.keys(presetsByGame).length,
+      totalPresets: result.rows.length
+    });
+  } catch (error) {
+    console.error('Error loading all presets:', error);
+    res.status(500).json({ error: 'Failed to load presets' });
+  }
+});
+
+// Delete all presets for a specific game
+app.delete('/api/presets/delete/:minigameKey', authenticateToken, async (req, res) => {
+  try {
+    const { minigameKey } = req.params;
+    const userId = req.user.userId;
+
+    console.log(`🗑️  Deleting all presets for user ${userId}, game: ${minigameKey}`);
+
+    const result = await pool.query(
+      'DELETE FROM user_presets WHERE user_id = $1 AND minigame_key = $2',
+      [userId, minigameKey]
+    );
+
+    console.log(`✅ Deleted ${result.rowCount} presets for ${minigameKey}`);
+
+    res.json({
+      success: true,
+      message: `Deleted ${result.rowCount} presets`,
+      count: result.rowCount
+    });
+  } catch (error) {
+    console.error('Error deleting presets:', error);
+    res.status(500).json({ error: 'Failed to delete presets' });
+  }
+});
+
+// Get preset sync status (last updated timestamp)
+app.get('/api/presets/status', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+
+    const result = await pool.query(
+      `SELECT minigame_key, MAX(updated_at) as last_updated, COUNT(*) as preset_count
+       FROM user_presets 
+       WHERE user_id = $1 
+       GROUP BY minigame_key`,
+      [userId]
+    );
+
+    const status = {};
+    result.rows.forEach(row => {
+      status[row.minigame_key] = {
+        lastUpdated: row.last_updated,
+        presetCount: parseInt(row.preset_count)
+      };
+    });
+
+    res.json({
+      success: true,
+      status,
+      totalGames: result.rows.length
+    });
+  } catch (error) {
+    console.error('Error getting preset status:', error);
+    res.status(500).json({ error: 'Failed to get preset status' });
   }
 });
 
