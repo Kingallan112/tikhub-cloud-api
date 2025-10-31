@@ -69,6 +69,89 @@ const pool = new Pool({
 const JWT_SECRET = process.env.JWT_SECRET || 'tikhub-secret-key-2024';
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'tikhub-admin-secret-2024';
 
+const EXCLUSIVE_GAMES = ['getting_over_it', 'pvz_abnormal'];
+const EXCLUSIVE_DEFAULT_DURATION_DAYS = 30;
+
+function sanitizeExclusiveGames(raw) {
+  let parsed = {};
+  let changed = false;
+
+  if (typeof raw === 'string') {
+    try {
+      parsed = JSON.parse(raw || '{}');
+    } catch (error) {
+      console.warn('[Exclusive] Failed to parse exclusive games JSON:', error);
+      parsed = {};
+      changed = true;
+    }
+  } else if (raw && typeof raw === 'object') {
+    parsed = { ...raw };
+  }
+
+  if (!parsed || typeof parsed !== 'object') {
+    parsed = {};
+    changed = true;
+  }
+
+  const result = {};
+  const now = Date.now();
+
+  EXCLUSIVE_GAMES.forEach((gameKey) => {
+    const existing = parsed[gameKey] && typeof parsed[gameKey] === 'object' ? parsed[gameKey] : {};
+
+    const sanitized = {
+      unlocked: !!existing.unlocked,
+      activatedAt: existing.activatedAt ? new Date(existing.activatedAt).toISOString() : null,
+      expiresAt: existing.expiresAt ? new Date(existing.expiresAt).toISOString() : null,
+      notes: existing.notes || null,
+    };
+
+    if (sanitized.expiresAt && !Number.isNaN(Date.parse(sanitized.expiresAt))) {
+      if (Date.parse(sanitized.expiresAt) <= now) {
+        if (sanitized.unlocked || sanitized.expiresAt !== null) {
+          changed = true;
+        }
+        sanitized.unlocked = false;
+        sanitized.expiresAt = null;
+        sanitized.activatedAt = null;
+      }
+    }
+
+    if (!sanitized.unlocked) {
+      sanitized.activatedAt = null;
+      sanitized.expiresAt = null;
+    }
+
+    const existingSerialized = JSON.stringify(existing || {});
+    const sanitizedSerialized = JSON.stringify(sanitized);
+    if (existingSerialized !== sanitizedSerialized) {
+      changed = true;
+    }
+
+    result[gameKey] = sanitized;
+  });
+
+  // Remove any unknown keys
+  Object.keys(parsed).forEach((key) => {
+    if (!EXCLUSIVE_GAMES.includes(key)) {
+      changed = true;
+    }
+  });
+
+  return { data: result, changed };
+}
+
+function createExclusiveGrantState(durationDays = EXCLUSIVE_DEFAULT_DURATION_DAYS) {
+  const now = new Date();
+  const expires = new Date(now.getTime() + durationDays * 24 * 60 * 60 * 1000);
+  return {
+    unlocked: true,
+    activatedAt: now.toISOString(),
+    expiresAt: expires.toISOString(),
+    notes: null,
+  };
+}
+
 // Test database connection
 pool.connect((err, client, done) => {
   if (err) {
@@ -417,11 +500,15 @@ app.get('/api/auth/verify', authenticateToken, (req, res) => {
 app.get('/api/subscription/status', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT * FROM subscriptions WHERE user_id = $1',
+      `SELECT s.*, u.exclusive_games
+       FROM subscriptions s
+       RIGHT JOIN users u ON s.user_id = u.id
+       WHERE u.id = $1`,
       [req.user.userId]
     );
 
     if (result.rows.length === 0) {
+      const exclusive = sanitizeExclusiveGames({});
       return res.json({
         subscription: {
           tier: 'free',
@@ -429,21 +516,25 @@ app.get('/api/subscription/status', authenticateToken, async (req, res) => {
           startDate: new Date().toISOString(),
           endDate: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString(),
           autoRenew: false
-        }
+        },
+        exclusiveGames: exclusive.data
       });
     }
 
     let subscription = result.rows[0];
+    const exclusive = sanitizeExclusiveGames(subscription.exclusive_games);
+    if (exclusive.changed) {
+      await pool.query('UPDATE users SET exclusive_games = $2 WHERE id = $1', [req.user.userId, JSON.stringify(exclusive.data)]);
+    }
 
     // Check if subscription has expired and auto-downgrade
-    if (subscription.tier !== 'free' && subscription.end_date) {
+    if (subscription.tier && subscription.tier !== 'free' && subscription.end_date) {
       const endDate = new Date(subscription.end_date);
       const now = new Date();
       
       if (now > endDate && subscription.status === 'active') {
         console.log(`⏰ Subscription expired for user ${req.user.userId}, downgrading to free tier`);
         
-        // Update to free tier in database
         await pool.query(
           `UPDATE subscriptions 
            SET tier = 'free', status = 'expired', last_updated = NOW()
@@ -451,7 +542,6 @@ app.get('/api/subscription/status', authenticateToken, async (req, res) => {
           [req.user.userId]
         );
         
-        // Return updated subscription
         subscription = {
           ...subscription,
           tier: 'free',
@@ -460,16 +550,15 @@ app.get('/api/subscription/status', authenticateToken, async (req, res) => {
       }
     }
 
-    // Convert snake_case to camelCase for frontend compatibility
     const formattedSubscription = {
-      tier: subscription.tier,
-      status: subscription.status,
+      tier: subscription.tier || 'free',
+      status: subscription.status || 'active',
       startDate: subscription.start_date ? new Date(subscription.start_date).toISOString() : new Date().toISOString(),
       endDate: subscription.end_date ? new Date(subscription.end_date).toISOString() : new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString(),
       autoRenew: subscription.auto_renew || false
     };
 
-    res.json({ subscription: formattedSubscription });
+    res.json({ subscription: formattedSubscription, exclusiveGames: exclusive.data });
   } catch (error) {
     console.error('Error fetching subscription:', error);
     res.status(500).json({ error: 'Failed to fetch subscription' });
@@ -506,11 +595,18 @@ app.post('/api/auth/register', async (req, res) => {
     const result = await pool.query(
       `INSERT INTO users (id, username, email, password_hash, device_info, created_at, last_activity)
        VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-       RETURNING id, username, email, created_at`,
+       RETURNING id, username, email, created_at, exclusive_games`,
       [userId, username, email, hashedPassword, JSON.stringify(deviceInfo || {})]
     );
 
-    const user = result.rows[0];
+    let user = result.rows[0];
+
+    // Ensure exclusive games structure exists
+    const exclusive = sanitizeExclusiveGames(user.exclusive_games);
+    if (exclusive.changed) {
+      await pool.query('UPDATE users SET exclusive_games = $2 WHERE id = $1', [user.id, JSON.stringify(exclusive.data)]);
+    }
+    user.exclusive_games = exclusive.data;
 
     // Create default free subscription
     const subResult = await pool.query(
@@ -539,7 +635,8 @@ app.post('/api/auth/register', async (req, res) => {
         username: user.username,
         email: user.email,
         createdAt: user.created_at,
-        subscription: subscription
+        subscription: subscription,
+        exclusiveGames: user.exclusive_games
       }
     });
   } catch (error) {
@@ -559,7 +656,7 @@ app.post('/api/auth/login', async (req, res) => {
 
     // Find user
     const result = await pool.query(
-      'SELECT id, username, email, password_hash FROM users WHERE email = $1',
+      'SELECT id, username, email, password_hash, exclusive_games FROM users WHERE email = $1',
       [email]
     );
 
@@ -567,7 +664,13 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ success: false, error: 'Invalid email or password' });
     }
 
-    const user = result.rows[0];
+    let user = result.rows[0];
+
+    const exclusive = sanitizeExclusiveGames(user.exclusive_games);
+    if (exclusive.changed) {
+      await pool.query('UPDATE users SET exclusive_games = $2 WHERE id = $1', [user.id, JSON.stringify(exclusive.data)]);
+    }
+    user.exclusive_games = exclusive.data;
 
     // Check password
     const validPassword = await bcrypt.compare(password, user.password_hash);
@@ -635,7 +738,8 @@ app.post('/api/auth/login', async (req, res) => {
         id: user.id,
         username: user.username,
         email: user.email,
-        subscription: subscription
+        subscription: subscription,
+        exclusiveGames: user.exclusive_games
       }
     });
   } catch (error) {
@@ -1210,7 +1314,7 @@ app.post('/api/users/login', async (req, res) => {
 app.get('/api/users/me', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT u.id, u.username, u.email, u.created_at, u.last_login,
+      `SELECT u.id, u.username, u.email, u.created_at, u.last_login, u.exclusive_games,
               s.tier, s.status, s.start_date, s.end_date
        FROM users u
        LEFT JOIN subscriptions s ON u.id = s.user_id
@@ -1222,7 +1326,29 @@ app.get('/api/users/me', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    res.json({ success: true, user: result.rows[0] });
+    const row = result.rows[0];
+    const exclusive = sanitizeExclusiveGames(row.exclusive_games);
+    if (exclusive.changed) {
+      await pool.query('UPDATE users SET exclusive_games = $2 WHERE id = $1', [row.id, JSON.stringify(exclusive.data)]);
+    }
+
+    res.json({
+      success: true,
+      user: {
+        id: row.id,
+        username: row.username,
+        email: row.email,
+        createdAt: row.created_at,
+        lastLogin: row.last_login,
+        subscription: {
+          tier: row.tier,
+          status: row.status,
+          startDate: row.start_date,
+          endDate: row.end_date,
+        },
+        exclusiveGames: exclusive.data,
+      }
+    });
   } catch (error) {
     console.error('Error fetching user:', error);
     res.status(500).json({ error: 'Failed to fetch user data' });
@@ -1275,6 +1401,7 @@ app.get('/api/admin/users', authenticateAdmin, async (req, res) => {
     let query = `
       SELECT u.id, u.username, u.email, u.created_at, u.last_login, u.last_activity,
               u.device_info, u.is_active,
+              u.exclusive_games,
               s.tier, s.status, s.start_date, s.end_date, s.auto_renew, s.admin_notes
        FROM users u
        LEFT JOIN subscriptions s ON u.id = s.user_id
@@ -1321,6 +1448,12 @@ app.get('/api/admin/users', authenticateAdmin, async (req, res) => {
     const expiredUsers = [];
     
     for (const user of users) {
+      const exclusive = sanitizeExclusiveGames(user.exclusive_games);
+      if (exclusive.changed) {
+        await pool.query('UPDATE users SET exclusive_games = $2 WHERE id = $1', [user.id, JSON.stringify(exclusive.data)]);
+      }
+      user.exclusive_games = exclusive.data;
+
       if (user.tier && user.tier !== 'free' && user.end_date) {
         const endDate = new Date(user.end_date);
         
@@ -1403,6 +1536,93 @@ app.post('/api/admin/update-subscription', authenticateAdmin, async (req, res) =
   } catch (error) {
     console.error('Error updating subscription:', error);
     res.status(500).json({ error: 'Failed to update subscription' });
+  }
+});
+
+app.post('/api/admin/exclusive-games/grant', authenticateAdmin, async (req, res) => {
+  try {
+    const { userId, gameKey, durationDays, notes } = req.body;
+
+    if (!userId || !gameKey) {
+      return res.status(400).json({ error: 'User ID and game key are required' });
+    }
+
+    if (!EXCLUSIVE_GAMES.includes(gameKey)) {
+      return res.status(400).json({ error: 'Invalid exclusive game key' });
+    }
+
+    const userResult = await pool.query('SELECT exclusive_games FROM users WHERE id = $1', [userId]);
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const exclusive = sanitizeExclusiveGames(userResult.rows[0].exclusive_games);
+    const grantState = createExclusiveGrantState(durationDays || EXCLUSIVE_DEFAULT_DURATION_DAYS);
+    grantState.notes = notes || null;
+    exclusive.data[gameKey] = grantState;
+
+    await pool.query('UPDATE users SET exclusive_games = $2 WHERE id = $1', [userId, JSON.stringify(exclusive.data)]);
+
+    await pool.query(
+      `INSERT INTO subscription_updates (user_id, subscription_data, updated_by, status)
+       VALUES ($1, $2, 'admin', 'pending')`,
+      [userId, JSON.stringify({ exclusiveGames: exclusive.data })]
+    );
+
+    console.log(`✅ Admin granted exclusive game "${gameKey}" to user ${userId}`);
+
+    res.json({
+      success: true,
+      exclusiveGames: exclusive.data
+    });
+  } catch (error) {
+    console.error('Error granting exclusive game:', error);
+    res.status(500).json({ error: 'Failed to grant exclusive game' });
+  }
+});
+
+app.post('/api/admin/exclusive-games/revoke', authenticateAdmin, async (req, res) => {
+  try {
+    const { userId, gameKey } = req.body;
+
+    if (!userId || !gameKey) {
+      return res.status(400).json({ error: 'User ID and game key are required' });
+    }
+
+    if (!EXCLUSIVE_GAMES.includes(gameKey)) {
+      return res.status(400).json({ error: 'Invalid exclusive game key' });
+    }
+
+    const userResult = await pool.query('SELECT exclusive_games FROM users WHERE id = $1', [userId]);
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const exclusive = sanitizeExclusiveGames(userResult.rows[0].exclusive_games);
+    exclusive.data[gameKey] = {
+      unlocked: false,
+      activatedAt: null,
+      expiresAt: null,
+      notes: null
+    };
+
+    await pool.query('UPDATE users SET exclusive_games = $2 WHERE id = $1', [userId, JSON.stringify(exclusive.data)]);
+
+    await pool.query(
+      `INSERT INTO subscription_updates (user_id, subscription_data, updated_by, status)
+       VALUES ($1, $2, 'admin', 'pending')`,
+      [userId, JSON.stringify({ exclusiveGames: exclusive.data })]
+    );
+
+    console.log(`✅ Admin revoked exclusive game "${gameKey}" from user ${userId}`);
+
+    res.json({
+      success: true,
+      exclusiveGames: exclusive.data
+    });
+  } catch (error) {
+    console.error('Error revoking exclusive game:', error);
+    res.status(500).json({ error: 'Failed to revoke exclusive game' });
   }
 });
 
@@ -1555,7 +1775,8 @@ app.post('/api/admin/init-db', authenticateAdmin, async (req, res) => {
         last_login TIMESTAMP,
         last_activity TIMESTAMP,
         is_active BOOLEAN DEFAULT true,
-        device_info JSONB
+        device_info JSONB,
+        exclusive_games JSONB DEFAULT '{}'::jsonb
       )
     `);
     
@@ -1564,7 +1785,8 @@ app.post('/api/admin/init-db', authenticateAdmin, async (req, res) => {
       ALTER TABLE users 
       ADD COLUMN IF NOT EXISTS provider VARCHAR(50) DEFAULT 'local',
       ADD COLUMN IF NOT EXISTS provider_id VARCHAR(255),
-      ADD COLUMN IF NOT EXISTS avatar_url TEXT
+      ADD COLUMN IF NOT EXISTS avatar_url TEXT,
+      ADD COLUMN IF NOT EXISTS exclusive_games JSONB DEFAULT '{}'::jsonb
     `);
 
     // Create subscriptions table
