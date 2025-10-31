@@ -429,11 +429,21 @@ const validateTikHubClient = (req, res, next) => {
 
 // Apply TikHub client validation to all API routes (except public ones)
 app.use('/api/', (req, res, next) => {
-  // Skip validation for public endpoints
-  const publicPaths = ['/api/health', '/api/status', '/api/'];
-  if (publicPaths.includes(req.path)) {
+  const fullPath = req.originalUrl || req.url || '';
+  const publicPrefixes = [
+    '/api/health',
+    '/api/status',
+    '/api/',
+    '/api/auth/google',
+    '/api/auth/google/callback',
+    '/api/auth/discord',
+    '/api/auth/discord/callback'
+  ];
+
+  if (publicPrefixes.some(prefix => fullPath.startsWith(prefix))) {
     return next();
   }
+
   validateTikHubClient(req, res, next);
 });
 
