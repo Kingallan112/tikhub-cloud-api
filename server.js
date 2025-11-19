@@ -66,7 +66,7 @@ const pool = new Pool({
 });
 
 // JWT Secret
-const JWT_SECRET = process.env.JWT_SECRET || 'tikhub-secret-key-2024';
+const EXCLUSIVE_GAMES = ['getting_over_it', 'pvz_abnormal', 'bouncing_ball'];
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'tikhub-admin-secret-2024';
 
 const EXCLUSIVE_GAMES = ['getting_over_it', 'pvz_abnormal'];
