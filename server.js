@@ -65,11 +65,12 @@ const pool = new Pool({
   }
 });
 
-// JWT Secret
-const EXCLUSIVE_GAMES = ['getting_over_it', 'pvz_abnormal', 'bouncing_ball'];
+// Secrets
+const JWT_SECRET = process.env.JWT_SECRET || 'tikhub-secret-key-2024';
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'tikhub-admin-secret-2024';
 
-const EXCLUSIVE_GAMES = ['getting_over_it', 'pvz_abnormal'];
+// Exclusive games supported by this API
+const EXCLUSIVE_GAMES = ['getting_over_it', 'pvz_abnormal', 'bouncing_ball'];
 const EXCLUSIVE_DEFAULT_DURATION_DAYS = 30;
 
 function sanitizeExclusiveGames(raw) {
@@ -2216,5 +2217,4 @@ app.listen(PORT, () => {
 process.on('unhandledRejection', (err) => {
   console.error('❌ Unhandled Promise Rejection:', err);
 });
-
 
