@@ -66,6 +66,24 @@ const pool = new Pool({
   }
 });
 
+// Ensure geo columns exist on users table for legacy databases
+const ensureUserGeoColumns = async () => {
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS location VARCHAR(255),
+    ADD COLUMN IF NOT EXISTS location_iso VARCHAR(10),
+    ADD COLUMN IF NOT EXISTS last_ip VARCHAR(64)
+  `);
+};
+
+(async () => {
+  try {
+    await ensureUserGeoColumns();
+  } catch (error) {
+    console.error('[GeoIP] Failed to ensure user geo columns:', error?.message || error);
+  }
+})();
+
 // JWT Secret
 const JWT_SECRET = process.env.JWT_SECRET || 'tikhub-secret-key-2024';
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'tikhub-admin-secret-2024';
