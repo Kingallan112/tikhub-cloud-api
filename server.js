@@ -42,24 +42,6 @@ const limiter = rateLimit({
   legacyHeaders: false, // Disable the `X-RateLimit-*` headers
 });
 
-app.delete('/api/admin/users/:userId', authenticateAdmin, async (req, res) => {
-  try {
-    const { userId } = req.params;
-    if (!userId) {
-      return res.status(400).json({ success: false, error: 'Missing userId' });
-    }
-
-    // Delete user cascades to subscriptions (ON DELETE CASCADE)
-    await pool.query('DELETE FROM users WHERE id = $1', [userId]);
-
-    console.log(`[Admin] Deleted user ${userId}`);
-    res.json({ success: true, message: `User ${userId} deleted` });
-  } catch (error) {
-    console.error('[Admin] Failed to delete user:', error);
-    res.status(500).json({ success: false, error: 'Failed to delete user' });
-  }
-});
-
 // Stricter rate limit for auth endpoints
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
@@ -533,6 +515,23 @@ const authenticateAdmin = (req, res, next) => {
   
   next();
 };
+
+app.delete('/api/admin/users/:userId', authenticateAdmin, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    if (!userId) {
+      return res.status(400).json({ error: 'Missing userId' });
+    }
+
+    await pool.query('DELETE FROM users WHERE id = $1', [userId]);
+
+    console.log(`[Admin] Deleted user ${userId}`);
+    res.json({ success: true, message: `User ${userId} deleted` });
+  } catch (error) {
+    console.error('[Admin] Failed to delete user:', error);
+    res.status(500).json({ error: 'Failed to delete user' });
+  }
+});
 
 // TikHub Client Validation Middleware
 const validateTikHubClient = (req, res, next) => {
