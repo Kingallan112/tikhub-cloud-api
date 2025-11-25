@@ -1951,9 +1951,32 @@ app.post('/api/admin/restore', authenticateAdmin, async (req, res) => {
 
 // ==================== CONTACT MESSAGE ENDPOINTS ====================
 
+let contactMessagesTableInitialized = false;
+const ensureContactMessagesTable = async () => {
+  if (contactMessagesTableInitialized) return;
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS contact_messages (
+      id SERIAL PRIMARY KEY,
+      name VARCHAR(255) NOT NULL,
+      email VARCHAR(255) NOT NULL,
+      subject VARCHAR(255) NOT NULL,
+      message TEXT NOT NULL,
+      status VARCHAR(50) DEFAULT 'new',
+      source VARCHAR(100) DEFAULT 'website',
+      created_at TIMESTAMP DEFAULT NOW(),
+      read_at TIMESTAMP,
+      handled_by VARCHAR(255)
+    )
+  `);
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_contact_messages_status ON contact_messages(status)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_contact_messages_created ON contact_messages(created_at DESC)');
+  contactMessagesTableInitialized = true;
+};
+
 // Public endpoint for website/app contact forms
 app.post('/api/contact-messages', async (req, res) => {
   try {
+    await ensureContactMessagesTable();
     const { name, email, subject, message, source } = req.body || {};
 
     if (!name || !email || !subject || !message) {
@@ -1983,6 +2006,7 @@ app.post('/api/contact-messages', async (req, res) => {
 // Admin endpoint to list contact messages
 app.get('/api/admin/contact-messages', authenticateAdmin, async (req, res) => {
   try {
+    await ensureContactMessagesTable();
     const { status = 'all', search, limit = 100, offset = 0 } = req.query;
 
     const values = [];
@@ -2038,6 +2062,7 @@ app.get('/api/admin/contact-messages', authenticateAdmin, async (req, res) => {
 // Admin endpoint to update contact message status/notes
 app.patch('/api/admin/contact-messages/:id', authenticateAdmin, async (req, res) => {
   try {
+    await ensureContactMessagesTable();
     const { id } = req.params;
     const { status, handledBy } = req.body || {};
 
