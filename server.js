@@ -8,6 +8,7 @@ const passport = require('passport');
 const GoogleStrategy = require('passport-google-oauth20').Strategy;
 const DiscordStrategy = require('passport-discord').Strategy;
 const session = require('express-session');
+const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -41,6 +42,24 @@ const limiter = rateLimit({
   legacyHeaders: false, // Disable the `X-RateLimit-*` headers
 });
 
+app.delete('/api/admin/users/:userId', authenticateAdmin, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    if (!userId) {
+      return res.status(400).json({ success: false, error: 'Missing userId' });
+    }
+
+    // Delete user cascades to subscriptions (ON DELETE CASCADE)
+    await pool.query('DELETE FROM users WHERE id = $1', [userId]);
+
+    console.log(`[Admin] Deleted user ${userId}`);
+    res.json({ success: true, message: `User ${userId} deleted` });
+  } catch (error) {
+    console.error('[Admin] Failed to delete user:', error);
+    res.status(500).json({ success: false, error: 'Failed to delete user' });
+  }
+});
+
 // Stricter rate limit for auth endpoints
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
@@ -65,13 +84,168 @@ const pool = new Pool({
   }
 });
 
-// Secrets
+// JWT Secret
 const JWT_SECRET = process.env.JWT_SECRET || 'tikhub-secret-key-2024';
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'tikhub-admin-secret-2024';
+const IPINFO_TOKEN = process.env.IPINFO_TOKEN || process.env.IPINFO_KEY;
 
-// Exclusive games supported by this API
-const EXCLUSIVE_GAMES = ['getting_over_it', 'pvz_abnormal', 'bouncing_ball'];
+const EXCLUSIVE_GAMES = ['getting_over_it', 'pvz_abnormal'];
 const EXCLUSIVE_DEFAULT_DURATION_DAYS = 30;
+const GEO_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+const geoCache = new Map();
+const regionDisplayNames = (typeof Intl !== 'undefined' && Intl.DisplayNames)
+  ? new Intl.DisplayNames(['en'], { type: 'region' })
+  : null;
+
+const fetchWithTimeout = async (url, options = {}, timeoutMs = 4000) => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
+const getClientIp = (req) => {
+  const headerIp = req.headers['cf-connecting-ip']
+    || req.headers['x-real-ip']
+    || req.headers['x-forwarded-for']?.split(',')[0]?.trim();
+  const rawIp = headerIp || req.ip || req.connection?.remoteAddress || req.socket?.remoteAddress;
+  if (!rawIp) return null;
+  return rawIp.replace('::ffff:', '').trim();
+};
+
+const isoToCountryName = (code) => {
+  if (!code) return null;
+  try {
+    return regionDisplayNames ? regionDisplayNames.of(code) : code;
+  } catch (error) {
+    return code;
+  }
+};
+
+const getCachedGeo = (ip) => {
+  const cached = geoCache.get(ip);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.data;
+  }
+  if (cached) geoCache.delete(ip);
+  return null;
+};
+
+const setCachedGeo = (ip, data) => {
+  geoCache.set(ip, {
+    data,
+    expiresAt: Date.now() + GEO_CACHE_TTL
+  });
+};
+
+async function lookupCountryFromIp(ip) {
+  if (!ip || ip === '::1' || ip === '127.0.0.1') {
+    return null;
+  }
+
+  const cached = getCachedGeo(ip);
+  if (cached) return cached;
+
+  try {
+    const ipapiResponse = await fetchWithTimeout(`https://ipapi.co/${ip}/json/`, {}, 5000);
+    if (ipapiResponse.ok) {
+      const data = await ipapiResponse.json();
+      if (!data.error && data.country_name && data.country) {
+        const result = {
+          name: data.country_name,
+          code: data.country.toUpperCase()
+        };
+        setCachedGeo(ip, result);
+        return result;
+      }
+    }
+  } catch (error) {
+    console.warn('[GeoIP] ipapi lookup failed:', error?.message);
+  }
+
+  if (IPINFO_TOKEN) {
+    try {
+      const url = `https://ipinfo.io/${ip}?token=${IPINFO_TOKEN}`;
+      const response = await fetchWithTimeout(url, {}, 5000);
+      if (response.ok) {
+        const body = await response.json();
+        if (body.country) {
+          const iso = body.country.toUpperCase();
+          const result = {
+            name: body.country_name || isoToCountryName(iso) || iso,
+            code: iso
+          };
+          setCachedGeo(ip, result);
+          return result;
+        }
+      }
+    } catch (error) {
+      console.warn('[GeoIP] ipinfo lookup failed:', error?.message);
+    }
+  }
+
+  return null;
+}
+
+async function captureUserCountry(userId, req) {
+  try {
+    const ip = getClientIp(req);
+    if (!ip) return;
+
+    await pool.query(
+      `UPDATE users SET last_ip = $1 WHERE id = $2`,
+      [ip, userId]
+    );
+
+    const geo = await lookupCountryFromIp(ip);
+    if (!geo) return;
+
+    await pool.query(
+      `UPDATE users SET location = $1, location_iso = $2 WHERE id = $3`,
+      [geo.name, geo.code, userId]
+    );
+
+    console.log(`[GeoIP] Updated user ${userId} location to ${geo.code}`);
+  } catch (error) {
+    console.warn('[GeoIP] Failed to update user location:', error?.message);
+  }
+}
+
+async function backfillLegacyUserCountries(batchSize = 50) {
+  try {
+    const { rows } = await pool.query(`
+      SELECT id, last_ip FROM users
+      WHERE (location IS NULL OR location = '' OR location_iso IS NULL OR location_iso = '')
+        AND last_ip IS NOT NULL
+      LIMIT $1
+    `, [batchSize]);
+
+    if (!rows.length) {
+      console.log('[GeoIP] Legacy user backfill complete.');
+      return;
+    }
+
+    for (const row of rows) {
+      const geo = await lookupCountryFromIp(row.last_ip);
+      if (geo) {
+        await pool.query(
+          `UPDATE users SET location = $1, location_iso = $2 WHERE id = $3`,
+          [geo.name, geo.code, row.id]
+        );
+        console.log(`[GeoIP] Backfilled user ${row.id} → ${geo.code}`);
+      }
+    }
+
+    setTimeout(() => backfillLegacyUserCountries(batchSize).catch(err =>
+      console.warn('[GeoIP] Backfill retry failed:', err?.message)
+    ), 2000);
+  } catch (error) {
+    console.warn('[GeoIP] Backfill error:', error?.message);
+  }
+}
 
 function sanitizeExclusiveGames(raw) {
   let parsed = {};
@@ -162,6 +336,11 @@ pool.connect((err, client, done) => {
     done();
   }
 });
+
+// Kick off legacy location backfill in background
+setTimeout(() => backfillLegacyUserCountries().catch(err =>
+  console.warn('[GeoIP] Initial backfill failed:', err?.message)
+), 5000);
 
 // ==================== PASSPORT OAUTH CONFIGURATION ====================
 
@@ -697,6 +876,8 @@ app.post('/api/auth/login', async (req, res) => {
       [user.id, JSON.stringify(deviceInfo || {})]
     );
 
+    captureUserCountry(user.id, req);
+
     // Get subscription
     const subResult = await pool.query(
       'SELECT * FROM subscriptions WHERE user_id = $1',
@@ -1190,6 +1371,8 @@ app.post('/api/users/register', async (req, res) => {
     );
 
     const user = result.rows[0];
+
+    captureUserCountry(user.id, req);
 
     // Create default free subscription
     await pool.query(
@@ -1767,6 +1950,128 @@ app.post('/api/admin/restore', authenticateAdmin, async (req, res) => {
   }
 });
 
+// ==================== CONTACT MESSAGE ENDPOINTS ====================
+
+// Public endpoint for website/app contact forms
+app.post('/api/contact-messages', async (req, res) => {
+  try {
+    const { name, email, subject, message, source } = req.body || {};
+
+    if (!name || !email || !subject || !message) {
+      return res.status(400).json({ success: false, error: 'Missing required fields' });
+    }
+
+    const cleanedSource = source && typeof source === 'string' ? source.substring(0, 100) : 'website';
+
+    const result = await pool.query(
+      `INSERT INTO contact_messages (name, email, subject, message, source)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, name, email, subject, message, status, source, created_at` ,
+      [name.trim(), email.trim(), subject.trim(), message.trim(), cleanedSource]
+    );
+
+    res.json({
+      success: true,
+      message: 'Message received',
+      data: result.rows[0]
+    });
+  } catch (error) {
+    console.error('Error saving contact message:', error);
+    res.status(500).json({ success: false, error: 'Failed to submit message' });
+  }
+});
+
+// Admin endpoint to list contact messages
+app.get('/api/admin/contact-messages', authenticateAdmin, async (req, res) => {
+  try {
+    const { status = 'all', search, limit = 100, offset = 0 } = req.query;
+
+    const values = [];
+    const whereClauses = [];
+
+    if (status !== 'all') {
+      values.push(status);
+      whereClauses.push(`status = $${values.length}`);
+    }
+
+    if (search) {
+      values.push(`%${search.trim().toLowerCase()}%`);
+      whereClauses.push(`(
+        LOWER(name) LIKE $${values.length} OR
+        LOWER(email) LIKE $${values.length} OR
+        LOWER(subject) LIKE $${values.length}
+      )`);
+    }
+
+    const limitIdx = values.length + 1;
+    const offsetIdx = values.length + 2;
+    values.push(Math.min(Number(limit) || 100, 500));
+    values.push(Math.max(Number(offset) || 0, 0));
+
+    const baseQuery = `SELECT id, name, email, subject, message, status, source, created_at, read_at, handled_by
+                       FROM contact_messages`;
+
+    const whereSql = whereClauses.length ? ` WHERE ${whereClauses.join(' AND ')}` : '';
+
+    const rows = await pool.query(
+      `${baseQuery}${whereSql}
+       ORDER BY created_at DESC
+       LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
+      values
+    );
+
+    const totalResult = await pool.query(
+      `SELECT COUNT(*) AS count FROM contact_messages${whereSql}`,
+      values.slice(0, values.length - 2)
+    );
+
+    res.json({
+      success: true,
+      messages: rows.rows,
+      total: Number(totalResult.rows[0]?.count || 0)
+    });
+  } catch (error) {
+    console.error('Error fetching contact messages:', error);
+    res.status(500).json({ success: false, error: 'Failed to load messages' });
+  }
+});
+
+// Admin endpoint to update contact message status/notes
+app.patch('/api/admin/contact-messages/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, handledBy } = req.body || {};
+
+    if (!id || !status) {
+      return res.status(400).json({ success: false, error: 'Missing id or status' });
+    }
+
+    const allowedStatuses = ['new', 'in_progress', 'resolved', 'archived'];
+    if (!allowedStatuses.includes(status)) {
+      return res.status(400).json({ success: false, error: 'Invalid status' });
+    }
+
+    const updateResult = await pool.query(
+      `UPDATE contact_messages
+       SET status = $1,
+           handled_by = COALESCE($2, handled_by),
+           read_at = CASE WHEN $1 <> 'new' THEN COALESCE(read_at, NOW()) ELSE read_at END
+       WHERE id = $3
+       RETURNING id, name, email, subject, message, status, source, created_at, read_at, handled_by` ,
+      [status, handledBy || null, id]
+    );
+
+    if (!updateResult.rows.length) {
+      return res.status(404).json({ success: false, error: 'Message not found' });
+    }
+
+    res.json({ success: true, message: updateResult.rows[0] });
+  } catch (error) {
+    console.error('Error updating contact message:', error);
+    res.status(500).json({ success: false, error: 'Failed to update message' });
+  }
+});
+
 // ==================== DATABASE INITIALIZATION ====================
 
 // Initialize database tables (run once)
@@ -1787,7 +2092,10 @@ app.post('/api/admin/init-db', authenticateAdmin, async (req, res) => {
         last_activity TIMESTAMP,
         is_active BOOLEAN DEFAULT true,
         device_info JSONB,
-        exclusive_games JSONB DEFAULT '{}'::jsonb
+        exclusive_games JSONB DEFAULT '{}'::jsonb,
+        location VARCHAR(255),
+        location_iso VARCHAR(10),
+        last_ip VARCHAR(64)
       )
     `);
     
@@ -1797,7 +2105,10 @@ app.post('/api/admin/init-db', authenticateAdmin, async (req, res) => {
       ADD COLUMN IF NOT EXISTS provider VARCHAR(50) DEFAULT 'local',
       ADD COLUMN IF NOT EXISTS provider_id VARCHAR(255),
       ADD COLUMN IF NOT EXISTS avatar_url TEXT,
-      ADD COLUMN IF NOT EXISTS exclusive_games JSONB DEFAULT '{}'::jsonb
+      ADD COLUMN IF NOT EXISTS exclusive_games JSONB DEFAULT '{}'::jsonb,
+      ADD COLUMN IF NOT EXISTS location VARCHAR(255),
+      ADD COLUMN IF NOT EXISTS location_iso VARCHAR(10),
+      ADD COLUMN IF NOT EXISTS last_ip VARCHAR(64)
     `);
 
     // Create subscriptions table
@@ -1857,6 +2168,25 @@ app.post('/api/admin/init-db', authenticateAdmin, async (req, res) => {
         UNIQUE(user_id, minigame_key, preset_id)
       )
     `);
+
+    // Create contact messages table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS contact_messages (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        email VARCHAR(255) NOT NULL,
+        subject VARCHAR(255) NOT NULL,
+        message TEXT NOT NULL,
+        status VARCHAR(50) DEFAULT 'new',
+        source VARCHAR(100) DEFAULT 'website',
+        created_at TIMESTAMP DEFAULT NOW(),
+        read_at TIMESTAMP,
+        handled_by VARCHAR(255)
+      )
+    `);
+
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_contact_messages_status ON contact_messages(status)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_contact_messages_created ON contact_messages(created_at DESC)');
 
     // Create indexes
     await pool.query('CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)');
@@ -2217,4 +2547,5 @@ app.listen(PORT, () => {
 process.on('unhandledRejection', (err) => {
   console.error('❌ Unhandled Promise Rejection:', err);
 });
+
 
