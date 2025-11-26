@@ -8,6 +8,7 @@ const passport = require('passport');
 const GoogleStrategy = require('passport-google-oauth20').Strategy;
 const DiscordStrategy = require('passport-discord').Strategy;
 const session = require('express-session');
+const axios = require('axios');
 const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 
 const app = express();
@@ -51,6 +52,57 @@ const authLimiter = rateLimit({
   }
 });
 
+// ==================== MOD DISTRIBUTION ENDPOINTS ====================
+
+const authenticateModRequest = (req, res, next) => {
+  const adminKey = req.header('X-Admin-Key');
+  const bearer = req.header('Authorization');
+  const bearerToken = bearer?.startsWith('Bearer ') ? bearer.slice(7) : null;
+  if (adminKey && adminKey === ADMIN_SECRET) {
+    return next();
+  }
+  if (bearerToken && bearerToken === ADMIN_SECRET) {
+    return next();
+  }
+  return res.status(401).json({ error: 'Unauthorized mod request' });
+};
+
+app.get('/api/mods', authenticateModRequest, async (req, res) => {
+  try {
+    const game = (req.query.game || '').toLowerCase();
+    if (!SUPPORTED_MOD_GAMES.includes(game)) {
+      return res.status(400).json({ error: 'Unsupported game key' });
+    }
+    const assets = await loadModAssetsForGame(game);
+    res.json({ success: true, mods: assets });
+  } catch (error) {
+    console.error('[Mods] Failed to load mods:', error.message);
+    const status = error.status || 500;
+    res.status(status).json({ error: error.message || 'Failed to load mods' });
+  }
+});
+
+app.get('/api/mods/:modId/download', authenticateModRequest, async (req, res) => {
+  try {
+    if (!GITHUB_TOKEN) {
+      return res.status(500).json({ error: 'GitHub token not configured' });
+    }
+    const modId = req.params.modId;
+    const friendlyName = req.query.name ? String(req.query.name).replace(/[^a-zA-Z0-9._-]/g, '_') : `mod-${modId}.zip`;
+    const assetUrl = `${GITHUB_API_BASE_URL}/releases/assets/${modId}`;
+    const response = await axios.get(assetUrl, {
+      headers: buildGithubHeaders({ Accept: 'application/octet-stream' }),
+      responseType: 'stream'
+    });
+    res.setHeader('Content-Disposition', `attachment; filename="${friendlyName}"`);
+    response.data.pipe(res);
+  } catch (error) {
+    const status = error.response?.status === 404 ? 404 : 500;
+    console.error('[Mods] Download error:', error.message);
+    res.status(status).json({ error: error.message || 'Failed to download mod' });
+  }
+});
+
 // Apply general rate limiter to all API routes
 app.use('/api/', limiter);
 
@@ -88,14 +140,38 @@ const ensureUserGeoColumns = async () => {
 const JWT_SECRET = process.env.JWT_SECRET || 'tikhub-secret-key-2024';
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'tikhub-admin-secret-2024';
 const IPINFO_TOKEN = process.env.IPINFO_TOKEN || process.env.IPINFO_KEY;
+const GITHUB_OWNER = process.env.GITHUB_OWNER || 'Kingallan112';
+const GITHUB_REPO = process.env.GITHUB_REPO || 'Tik-Game';
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || process.env.GITHUB_PAT;
 
-const EXCLUSIVE_GAMES = ['getting_over_it', 'pvz_abnormal'];
+const EXCLUSIVE_GAMES = ['getting_over_it', 'pvz_abnormal', 'bouncing_ball'];
 const EXCLUSIVE_DEFAULT_DURATION_DAYS = 30;
 const GEO_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
 const geoCache = new Map();
 const regionDisplayNames = (typeof Intl !== 'undefined' && Intl.DisplayNames)
   ? new Intl.DisplayNames(['en'], { type: 'region' })
   : null;
+const GITHUB_API_BASE_URL = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}`;
+const GAME_RELEASE_TAGS = {
+  l4d2: 'l4d2',
+  pvz1: 'pvz',
+  pvz_hybrid: 'pvzhybrid',
+  pvz_fusion: 'fusion',
+  pvz2: 'Pvz2',
+  pvz_abnormal: 'pvzabnormal',
+  only_climb: 'onlyclimb',
+  gta_chaos: 'chaos',
+  gta_koh: 'chaos',
+  mc_sandbox: 'sandbox',
+  mc_bedrock: 'Minecraft',
+  roblox: 'roblox',
+  mari0: 'Mari0',
+  getting_over_it: 'getting_over_it',
+  zombie_food: 'zombiefood',
+  bouncing_ball: 'Bouncingball'
+};
+const SUPPORTED_MOD_GAMES = Object.keys(GAME_RELEASE_TAGS);
+const ALLOWED_ASSET_EXTENSIONS = ['.zip', '.rar', '.7z', '.exe', '.jar'];
 
 const fetchWithTimeout = async (url, options = {}, timeoutMs = 4000) => {
   const controller = new AbortController();
@@ -314,6 +390,102 @@ function sanitizeExclusiveGames(raw) {
   });
 
   return { data: result, changed };
+}
+
+const buildGithubHeaders = (extra = {}) => {
+  const headers = {
+    'User-Agent': 'TikHub-Cloud-API',
+    'Accept': 'application/vnd.github+json',
+    ...extra,
+  };
+  if (GITHUB_TOKEN) {
+    headers.Authorization = `Bearer ${GITHUB_TOKEN}`;
+  }
+  return headers;
+};
+
+const hasAllowedExtension = (name = '') => {
+  const lower = name.toLowerCase();
+  return ALLOWED_ASSET_EXTENSIONS.some(ext => lower.endsWith(ext));
+};
+
+const isAssetRelevant = (gameKey, assetName = '') => {
+  const name = assetName.toLowerCase();
+  switch (gameKey) {
+    case 'l4d2':
+      return name.includes('l4d2') || name.includes('cfg') || name.includes('config') || name.includes('left4dead');
+    case 'pvz1':
+      return (name.includes('pvz') || name.includes('plant') || name.includes('zombie') || name.includes('tool')) &&
+             !name.includes('hybrid') && !name.includes('fusion');
+    case 'pvz_hybrid':
+      return (name.includes('hybrid') || name.includes('tool')) &&
+             !name.includes('original') && !name.includes('fusion');
+    case 'pvz_fusion':
+      return name.includes('fusion') && !name.includes('hybrid');
+    case 'pvz2':
+      return name.includes('pvz2') || name.includes('garden') || name.includes('gardendless');
+    case 'only_climb':
+      return name.includes('onlyclimb') || name.includes('ocbt');
+    case 'gta_chaos':
+      return name.includes('chaos') || name.includes('gta');
+    case 'gta_koh':
+      return name.includes('koh') || name.includes('gta') || name.includes('king');
+    case 'mc_sandbox':
+      return name.includes('mc') || name.includes('minecraft') || name.includes('sandbox') || name.includes('plugin');
+    case 'mc_bedrock':
+      return name.includes('bedrock') || name.includes('nukkit') || name.includes('pmmp');
+    case 'roblox':
+      return name.includes('roblox') || name.includes('rbx');
+    case 'mari0':
+      return name.includes('mari0') || name.includes('mario');
+    case 'getting_over_it':
+      return name.includes('getting') || name.includes('over') || name.includes('goi');
+    case 'zombie_food':
+      return name.includes('zombie') || name.includes('food');
+    case 'bouncing_ball':
+      return name.includes('bouncing') || name.includes('ball');
+    default:
+      return true;
+  }
+};
+
+async function fetchGithubRelease(tag) {
+  const url = `${GITHUB_API_BASE_URL}/releases/tags/${tag}`;
+  return axios.get(url, { headers: buildGithubHeaders() });
+}
+
+async function loadModAssetsForGame(gameKey) {
+  if (!GITHUB_TOKEN) {
+    throw new Error('GitHub token is not configured on the server');
+  }
+  const tag = GAME_RELEASE_TAGS[gameKey];
+  if (!tag) {
+    const error = new Error('Unsupported game');
+    error.status = 400;
+    throw error;
+  }
+  try {
+    const response = await fetchGithubRelease(tag);
+    const assets = response.data?.assets || [];
+    return assets
+      .filter(asset => hasAllowedExtension(asset.name) && isAssetRelevant(gameKey, asset.name))
+      .map(asset => ({
+        id: asset.id,
+        name: asset.name,
+        size: asset.size,
+        contentType: asset.content_type,
+        updatedAt: asset.updated_at,
+        downloadUrl: `/api/mods/${asset.id}/download?name=${encodeURIComponent(asset.name)}`
+      }));
+  } catch (error) {
+    const status = error.response?.status;
+    if (status === 404) {
+      const notFound = new Error('Release not found for game');
+      notFound.status = 404;
+      throw notFound;
+    }
+    throw error;
+  }
 }
 
 function createExclusiveGrantState(durationDays = EXCLUSIVE_DEFAULT_DURATION_DAYS) {
