@@ -12,6 +12,7 @@ const session = require('express-session');
 const axios = require('axios');
 const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 const { getTierForVariantId, lemonWebhookSecret } = require('./lemonConfig');
+const { PAYPAL_ENABLED, verifyPayPalWebhook, getTierForPlanId, getPlanMeta } = require('./paypalConfig');
 const MAX_WEBHOOK_BODY_BYTES = 1024 * 1024; // 1MB safety limit
 
 const LEMON_RELEVANT_EVENTS = new Set([
@@ -24,6 +25,19 @@ const LEMON_RELEVANT_EVENTS = new Set([
   'payment_failed',
 ]);
 
+const PAYPAL_RELEVANT_EVENTS = new Set([
+  'BILLING.SUBSCRIPTION.ACTIVATED',
+  'BILLING.SUBSCRIPTION.UPDATED',
+  'BILLING.SUBSCRIPTION.CANCELLED',
+  'BILLING.SUBSCRIPTION.EXPIRED',
+  'BILLING.SUBSCRIPTION.SUSPENDED',
+  'BILLING.SUBSCRIPTION.RE-ACTIVATED',
+  'PAYMENT.SALE.COMPLETED',
+  'PAYMENT.SALE.DENIED',
+  'PAYMENT.SALE.REFUNDED',
+  'PAYMENT.SALE.REVERSED',
+]);
+
 function verifyLemonSignature(signature, rawBody) {
   if (!lemonWebhookSecret || !signature || !rawBody) return false;
   try {
@@ -33,6 +47,71 @@ function verifyLemonSignature(signature, rawBody) {
     if (signedBuffer.length !== computedBuffer.length) {
       return false;
     }
+
+function mapPayPalStatus(status, eventType = '') {
+  const normalized = (status || '').toLowerCase();
+  if (eventType === 'BILLING.SUBSCRIPTION.CANCELLED' || eventType === 'PAYMENT.SALE.REFUNDED') {
+    return 'cancelled';
+  }
+  if (eventType === 'BILLING.SUBSCRIPTION.EXPIRED') {
+    return 'expired';
+  }
+  if (eventType === 'BILLING.SUBSCRIPTION.SUSPENDED' || eventType === 'PAYMENT.SALE.DENIED') {
+    return 'past_due';
+  }
+
+  switch (normalized) {
+    case 'active':
+    case 'approved':
+    case 'reactivated':
+      return 'active';
+    case 'suspended':
+    case 'cancelled':
+    case 'canceled':
+      return 'cancelled';
+    case 'expired':
+      return 'expired';
+    case 'pending':
+    case 'approved_pending':
+      return 'pending';
+    default:
+      return 'pending';
+  }
+}
+
+function addIntervalToDate(startIso, interval = 'monthly') {
+  if (!startIso) return null;
+  const date = new Date(startIso);
+  if (Number.isNaN(date.getTime())) return null;
+
+  switch ((interval || '').toLowerCase()) {
+    case 'daily':
+      date.setUTCDate(date.getUTCDate() + 1);
+      break;
+    case 'weekly':
+      date.setUTCDate(date.getUTCDate() + 7);
+      break;
+    case 'annual':
+    case 'yearly':
+    case 'year':
+      date.setUTCFullYear(date.getUTCFullYear() + 1);
+      break;
+    default:
+      date.setUTCDate(date.getUTCDate() + 30);
+      break;
+  }
+
+  return date.toISOString();
+}
+
+function pickFirstEmail(candidates = []) {
+  for (const value of candidates) {
+    if (typeof value === 'string' && value.includes('@')) {
+      return value;
+    }
+  }
+  return null;
+}
     return crypto.timingSafeEqual(signedBuffer, computedBuffer);
   } catch (error) {
     console.warn('[LemonSqueezy] Failed to verify signature:', error?.message);
@@ -134,6 +213,50 @@ async function handleSubscriptionEvent(payload) {
       lemonVariantId,
       customerEmail,
     });
+
+app.post('/api/paypal/webhook', async (req, res) => {
+  if (!PAYPAL_ENABLED) {
+    return res.status(503).json({ error: 'PayPal not configured' });
+  }
+
+  const rawBody = req.rawBody ? req.rawBody.toString('utf8') : JSON.stringify(req.body || {});
+  let payload = req.body;
+  if (!payload || Object.keys(payload).length === 0) {
+    try {
+      payload = JSON.parse(rawBody || '{}');
+    } catch (error) {
+      return res.status(400).json({ error: 'Invalid JSON payload' });
+    }
+  }
+
+  try {
+    const verification = await verifyPayPalWebhook(req.headers, rawBody);
+    if (!verification.verified) {
+      console.warn('[PayPal] Webhook verification failed:', verification.reason || verification.verificationStatus);
+      return res.status(401).json({ error: 'Invalid signature' });
+    }
+
+    const eventType = payload?.event_type;
+    if (!eventType) {
+      return res.status(400).json({ error: 'Missing event type' });
+    }
+
+    if (!PAYPAL_RELEVANT_EVENTS.has(eventType)) {
+      return res.json({ success: true, ignored: true });
+    }
+
+    const result = await handlePayPalSubscriptionEvent(payload);
+    if (!result.success) {
+      return res.status(202).json({ success: false, reason: result.reason });
+    }
+
+    console.log(`[PayPal] Processed ${eventType} for user ${result.userId} -> ${result.tier}`);
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('[PayPal] Webhook processing failed:', error);
+    return res.status(500).json({ error: 'Failed to process PayPal webhook' });
+  }
+});
     return { success: false, reason: 'user_not_found' };
   }
 
@@ -155,6 +278,91 @@ async function handleSubscriptionEvent(payload) {
   };
 }
 
+async function handlePayPalSubscriptionEvent(eventPayload) {
+  const resource = eventPayload?.resource || {};
+  const eventType = eventPayload?.event_type || 'unknown';
+  const planId = resource?.plan_id
+    || resource?.billing_agreement_details?.plan_id
+    || resource?.billing_agreement_id;
+
+  const tier = getTierForPlanId(planId);
+  if (!tier) {
+    console.warn('[PayPal] Unknown plan ID received:', planId);
+    return { success: false, reason: 'plan_not_configured' };
+  }
+
+  const planMeta = getPlanMeta(planId) || {};
+
+  let userId = resource?.custom_id || resource?.customId;
+  const subscriberEmail = pickFirstEmail([
+    resource?.subscriber?.email_address,
+    resource?.billing_agreement_details?.payer?.payer_info?.email_address,
+    resource?.payer?.payer_info?.email_address,
+    resource?.payer?.email_address,
+  ]);
+
+  if (!userId && subscriberEmail) {
+    const { rows } = await pool.query('SELECT id FROM users WHERE email = $1', [subscriberEmail.toLowerCase()]);
+    if (rows.length > 0) {
+      userId = rows[0].id;
+    }
+  }
+
+  if (!userId) {
+    console.warn('[PayPal] Unable to resolve user for event', {
+      eventType,
+      planId,
+      subscriberEmail,
+    });
+    return { success: false, reason: 'user_not_found' };
+  }
+
+  const startDate = normalizeDate(
+    resource?.start_time
+    || resource?.create_time
+    || resource?.billing_agreement_details?.start_time,
+  ) || new Date().toISOString();
+
+  const billingInfo = resource?.billing_info || {};
+  const nextBillingTime = billingInfo?.next_billing_time;
+  const cycleExecutions = Array.isArray(billingInfo?.cycle_executions) ? billingInfo.cycle_executions : [];
+  const remainingCycles = cycleExecutions.reduce((sum, exec) => sum + (Number(exec.remaining_cycles) || 0), 0);
+
+  let endDate = normalizeDate(
+    nextBillingTime
+    || resource?.end_time
+    || billingInfo?.last_payment?.time
+  );
+
+  if (!endDate && planMeta && startDate) {
+    endDate = addIntervalToDate(startDate, planMeta.interval || 'monthly');
+  }
+
+  if (!endDate && tier !== 'free' && startDate) {
+    endDate = addIntervalToDate(startDate, 'monthly');
+  }
+
+  const status = mapPayPalStatus(resource?.status, eventType);
+  const autoRenew = Boolean(nextBillingTime) && remainingCycles > 0;
+
+  await upsertSubscriptionRecord({
+    userId,
+    tier,
+    status,
+    startDate,
+    endDate,
+    autoRenew,
+  });
+
+  return {
+    success: true,
+    userId,
+    tier,
+    status,
+    subscriptionId: resource?.id || resource?.billing_agreement_id || null,
+  };
+}
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -168,7 +376,8 @@ app.use(cors({
 }));
 app.use(express.json({
   verify: (req, res, buf) => {
-    if ((req.originalUrl || '').startsWith('/api/lemonsqueezy/webhook')) {
+    const url = req.originalUrl || '';
+    if (url.startsWith('/api/lemonsqueezy/webhook') || url.startsWith('/api/paypal/webhook')) {
       req.rawBody = Buffer.from(buf);
     }
   },
