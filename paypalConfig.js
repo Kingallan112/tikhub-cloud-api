@@ -6,6 +6,13 @@ const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
 const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
 const PAYPAL_WEBHOOK_ID = process.env.PAYPAL_WEBHOOK_ID;
 
+console.log('[PayPal] runtime config', {
+  env: PAYPAL_ENV,
+  apiBase: PAYPAL_API_BASE,
+  client: PAYPAL_CLIENT_ID ? `${PAYPAL_CLIENT_ID.slice(0, 6)}…${PAYPAL_CLIENT_ID.slice(-4)}` : null,
+  webhook: PAYPAL_WEBHOOK_ID || null,
+});
+
 const planConfig = [
   { envKey: 'PAYPAL_PRO_MONTHLY_PLAN_ID', tier: 'pro', interval: 'monthly' },
   { envKey: 'PAYPAL_PRO_ANNUAL_PLAN_ID', tier: 'pro', interval: 'annual' },
