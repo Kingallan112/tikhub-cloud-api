@@ -347,7 +347,11 @@ app.post('/api/paypal/webhook', async (req, res) => {
   try {
     const verification = await verifyPayPalWebhook(req.headers, rawBody);
     if (!verification.verified) {
-      console.warn('[PayPal] Webhook verification failed:', verification.reason || verification.verificationStatus);
+      console.warn('[PayPal] Webhook verification failed:', verification.reason || verification.verificationStatus, {
+        verificationStatus: verification.verificationStatus,
+        reason: verification.reason,
+        response: verification.data || null,
+      });
       return res.status(401).json({ error: 'Invalid signature' });
     }
 
