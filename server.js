@@ -11,20 +11,32 @@ const DiscordStrategy = require('passport-discord').Strategy;
 const session = require('express-session');
 const axios = require('axios');
 const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
-const { PAYPAL_ENABLED, verifyPayPalWebhook, getTierForPlanId, getPlanMeta } = require('./paypalConfig');
+const { PAYPAL_ENABLED, verifyPayPalWebhook, getTierForPlanId, getPlanMeta, getPlanMetaForTier } = require('./paypalConfig');
 const MAX_WEBHOOK_BODY_BYTES = 1024 * 1024; // 1MB safety limit
 
-const PAYPAL_RELEVANT_EVENTS = new Set([
+const PAYPAL_SUBSCRIPTION_EVENTS = new Set([
   'BILLING.SUBSCRIPTION.ACTIVATED',
   'BILLING.SUBSCRIPTION.UPDATED',
   'BILLING.SUBSCRIPTION.CANCELLED',
   'BILLING.SUBSCRIPTION.EXPIRED',
   'BILLING.SUBSCRIPTION.SUSPENDED',
   'BILLING.SUBSCRIPTION.RE-ACTIVATED',
+]);
+
+const PAYPAL_DIRECT_PAYMENT_EVENTS = new Set([
   'PAYMENT.SALE.COMPLETED',
   'PAYMENT.SALE.DENIED',
   'PAYMENT.SALE.REFUNDED',
   'PAYMENT.SALE.REVERSED',
+  'PAYMENT.CAPTURE.COMPLETED',
+  'PAYMENT.CAPTURE.DENIED',
+  'CHECKOUT.ORDER.APPROVED',
+  'CHECKOUT.ORDER.COMPLETED',
+]);
+
+const PAYPAL_RELEVANT_EVENTS = new Set([
+  ...PAYPAL_SUBSCRIPTION_EVENTS,
+  ...PAYPAL_DIRECT_PAYMENT_EVENTS,
 ]);
 
 function mapPayPalStatus(status, eventType = '') {
@@ -35,7 +47,7 @@ function mapPayPalStatus(status, eventType = '') {
   if (eventType === 'BILLING.SUBSCRIPTION.EXPIRED') {
     return 'expired';
   }
-  if (eventType === 'BILLING.SUBSCRIPTION.SUSPENDED' || eventType === 'PAYMENT.SALE.DENIED') {
+  if (eventType === 'BILLING.SUBSCRIPTION.SUSPENDED' || eventType === 'PAYMENT.SALE.DENIED' || eventType === 'PAYMENT.CAPTURE.DENIED') {
     return 'past_due';
   }
 
@@ -99,6 +111,54 @@ function normalizeDate(value) {
   return date.toISOString();
 }
 
+function parseCustomMetadata(raw) {
+  if (!raw || typeof raw !== 'string') {
+    return null;
+  }
+  const parts = raw.split('|').map(part => part?.trim() || null);
+  if (parts.length === 0) {
+    return null;
+  }
+  const [userId, email, tier] = parts;
+  return {
+    userId: userId || null,
+    email: email || null,
+    tier: tier || null,
+    raw,
+  };
+}
+
+function extractCustomMetadata(resource = {}) {
+  const candidates = [];
+  if (resource?.custom_id) candidates.push(resource.custom_id);
+  if (resource?.customId) candidates.push(resource.customId);
+  if (resource?.invoice_id) candidates.push(resource.invoice_id);
+  if (resource?.invoiceId) candidates.push(resource.invoiceId);
+  if (Array.isArray(resource?.purchase_units)) {
+    resource.purchase_units.forEach(unit => {
+      if (unit?.custom_id) candidates.push(unit.custom_id);
+      if (unit?.invoice_id) candidates.push(unit.invoice_id);
+    });
+  }
+  for (const raw of candidates) {
+    const parsed = parseCustomMetadata(raw);
+    if (parsed && (parsed.userId || parsed.email || parsed.tier)) {
+      return parsed;
+    }
+  }
+  return null;
+}
+
+async function resolveUserIdFromEmail(email) {
+  if (!email) return null;
+  const normalized = email.toLowerCase();
+  const { rows } = await pool.query('SELECT id FROM users WHERE email = $1', [normalized]);
+  if (rows.length > 0) {
+    return rows[0].id;
+  }
+  return null;
+}
+
 async function upsertSubscriptionRecord({
   userId,
   tier,
@@ -130,6 +190,78 @@ async function upsertSubscriptionRecord({
   await pool.query(`UPDATE users SET plan = $2 WHERE id = $1`, [userId, tier]);
 }
 
+async function handlePayPalDirectPurchaseEvent(eventPayload) {
+  const resource = eventPayload?.resource || {};
+  const eventType = eventPayload?.event_type || 'PAYMENT.CAPTURE.COMPLETED';
+  const metadata = extractCustomMetadata(resource) || {};
+
+  let tier = metadata?.tier;
+  if (!tier && resource?.plan_id) {
+    tier = getTierForPlanId(resource.plan_id);
+  }
+  if (!tier && resource?.amount?.value) {
+    const amount = Number(resource.amount.value);
+    if (!Number.isNaN(amount)) {
+      if (amount >= 40) tier = 'legend';
+      else if (amount >= 15) tier = 'pro';
+    }
+  }
+  if (!tier) {
+    console.warn('[PayPal] Unable to infer tier from direct payment event', {
+      eventType,
+      metadata,
+      amount: resource?.amount,
+    });
+    return { success: false, reason: 'tier_not_detected' };
+  }
+
+  let userId = metadata?.userId;
+  const payerEmail = metadata?.email || pickFirstEmail([
+    resource?.payer?.email_address,
+    resource?.payer?.payer_info?.email_address,
+    resource?.supplementary_data?.related_ids?.payer?.email_address,
+  ]);
+  if (!userId && payerEmail) {
+    userId = await resolveUserIdFromEmail(payerEmail);
+  }
+
+  if (!userId) {
+    console.warn('[PayPal] Unable to resolve user for direct payment event', {
+      eventType,
+      tier,
+      payerEmail,
+      metadata,
+    });
+    return { success: false, reason: 'user_not_found' };
+  }
+
+  const planMeta = getPlanMetaForTier(tier) || { interval: 'monthly' };
+  const startDate = normalizeDate(resource?.create_time || resource?.update_time || eventPayload?.create_time) || new Date().toISOString();
+  let endDate = addIntervalToDate(startDate, planMeta.interval || 'monthly');
+  if (!endDate && tier !== 'free') {
+    endDate = addIntervalToDate(startDate, 'monthly');
+  }
+
+  const status = mapPayPalStatus(resource?.status || 'COMPLETED', eventType);
+
+  await upsertSubscriptionRecord({
+    userId,
+    tier,
+    status,
+    startDate,
+    endDate,
+    autoRenew: false,
+  });
+
+  return {
+    success: true,
+    userId,
+    tier,
+    status,
+    subscriptionId: resource?.id || resource?.supplementary_data?.related_ids?.order_id || null,
+  };
+}
+
 async function handlePayPalSubscriptionEvent(eventPayload) {
   const resource = eventPayload?.resource || {};
   const eventType = eventPayload?.event_type || 'unknown';
@@ -137,16 +269,20 @@ async function handlePayPalSubscriptionEvent(eventPayload) {
     || resource?.billing_agreement_details?.plan_id
     || resource?.billing_agreement_id;
 
-  const tier = getTierForPlanId(planId);
+  const metadata = extractCustomMetadata(resource) || {};
+  let tier = metadata?.tier || getTierForPlanId(planId);
+  if (!tier && metadata?.raw) {
+    tier = metadata.raw.split('|').pop();
+  }
   if (!tier) {
-    console.warn('[PayPal] Unknown plan ID received:', planId);
+    console.warn('[PayPal] Unknown plan ID/tier received:', { planId, metadata });
     return { success: false, reason: 'plan_not_configured' };
   }
 
-  const planMeta = getPlanMeta(planId) || {};
+  const planMeta = getPlanMeta(planId) || getPlanMetaForTier(tier) || {};
 
-  let userId = resource?.custom_id || resource?.customId;
-  const subscriberEmail = pickFirstEmail([
+  let userId = metadata?.userId || resource?.custom_id || resource?.customId;
+  const subscriberEmail = metadata?.email || pickFirstEmail([
     resource?.subscriber?.email_address,
     resource?.billing_agreement_details?.payer?.payer_info?.email_address,
     resource?.payer?.payer_info?.email_address,
@@ -154,10 +290,7 @@ async function handlePayPalSubscriptionEvent(eventPayload) {
   ]);
 
   if (!userId && subscriberEmail) {
-    const { rows } = await pool.query('SELECT id FROM users WHERE email = $1', [subscriberEmail.toLowerCase()]);
-    if (rows.length > 0) {
-      userId = rows[0].id;
-    }
+    userId = await resolveUserIdFromEmail(subscriberEmail);
   }
 
   if (!userId) {
@@ -369,7 +502,12 @@ app.post('/api/paypal/webhook', async (req, res) => {
       return res.json({ success: true, ignored: true });
     }
 
-    const result = await handlePayPalSubscriptionEvent(payload);
+    let result;
+    if (PAYPAL_SUBSCRIPTION_EVENTS.has(eventType)) {
+      result = await handlePayPalSubscriptionEvent(payload);
+    } else {
+      result = await handlePayPalDirectPurchaseEvent(payload);
+    }
     if (!result.success) {
       return res.status(202).json({ success: false, reason: result.reason });
     }
