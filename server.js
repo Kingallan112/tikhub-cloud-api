@@ -11,19 +11,8 @@ const DiscordStrategy = require('passport-discord').Strategy;
 const session = require('express-session');
 const axios = require('axios');
 const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
-const { getTierForVariantId, lemonWebhookSecret } = require('./lemonConfig');
 const { PAYPAL_ENABLED, verifyPayPalWebhook, getTierForPlanId, getPlanMeta } = require('./paypalConfig');
 const MAX_WEBHOOK_BODY_BYTES = 1024 * 1024; // 1MB safety limit
-
-const LEMON_RELEVANT_EVENTS = new Set([
-  'subscription_created',
-  'subscription_updated',
-  'subscription_cancelled',
-  'subscription_expired',
-  'subscription_paused',
-  'order_refunded',
-  'payment_failed',
-]);
 
 const PAYPAL_RELEVANT_EVENTS = new Set([
   'BILLING.SUBSCRIPTION.ACTIVATED',
@@ -37,16 +26,6 @@ const PAYPAL_RELEVANT_EVENTS = new Set([
   'PAYMENT.SALE.REFUNDED',
   'PAYMENT.SALE.REVERSED',
 ]);
-
-function verifyLemonSignature(signature, rawBody) {
-  if (!lemonWebhookSecret || !signature || !rawBody) return false;
-  try {
-    const signedBuffer = Buffer.from(signature, 'utf8');
-    const computed = crypto.createHmac('sha256', lemonWebhookSecret).update(rawBody).digest('hex');
-    const computedBuffer = Buffer.from(computed, 'utf8');
-    if (signedBuffer.length !== computedBuffer.length) {
-      return false;
-    }
 
 function mapPayPalStatus(status, eventType = '') {
   const normalized = (status || '').toLowerCase();
@@ -112,40 +91,12 @@ function pickFirstEmail(candidates = []) {
   }
   return null;
 }
-    return crypto.timingSafeEqual(signedBuffer, computedBuffer);
-  } catch (error) {
-    console.warn('[LemonSqueezy] Failed to verify signature:', error?.message);
-    return false;
-  }
-}
 
 function normalizeDate(value) {
   if (!value) return null;
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return null;
   return date.toISOString();
-}
-
-function mapLemonStatus(status) {
-  switch ((status || '').toLowerCase()) {
-    case 'active':
-    case 'trialing':
-    case 'on_trial':
-      return 'active';
-    case 'past_due':
-    case 'unpaid':
-    case 'payment_failed':
-      return 'past_due';
-    case 'cancelled':
-    case 'canceled':
-      return 'cancelled';
-    case 'expired':
-      return 'expired';
-    case 'paused':
-      return 'pending';
-    default:
-      return 'pending';
-  }
 }
 
 async function upsertSubscriptionRecord({
@@ -177,61 +128,6 @@ async function upsertSubscriptionRecord({
   }
 
   await pool.query(`UPDATE users SET plan = $2 WHERE id = $1`, [userId, tier]);
-}
-
-async function handleSubscriptionEvent(payload) {
-  const attributes = payload?.data?.attributes || {};
-  const custom = attributes?.custom_data || {};
-  const customerEmail = attributes?.customer_email || attributes?.user_email;
-  const eventName = payload?.meta?.event_name;
-  if (eventName === 'order_refunded') {
-    attributes.status = 'cancelled';
-  }
-  const lemonSubscriptionId = attributes?.subscription_id || attributes?.id;
-  const variantRelationshipId = payload?.data?.relationships?.variant?.data?.id;
-  const lemonVariantId = attributes?.variant_id || attributes?.price_id || variantRelationshipId;
-  const status = mapLemonStatus(attributes?.status);
-  const tier = getTierForVariantId(lemonVariantId) || 'free';
-  const startDate = normalizeDate(attributes?.created_at || attributes?.starts_at) || new Date().toISOString();
-  const endDate =
-    normalizeDate(attributes?.renews_at || attributes?.ends_at || attributes?.expires_at) ||
-    (tier === 'free' ? null : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString());
-  const autoRenew = attributes?.pause || attributes?.cancel_at ? false : true;
-
-  let userId = custom?.user_id || custom?.userId;
-
-  if (!userId && customerEmail) {
-    const userResult = await pool.query('SELECT id FROM users WHERE email = $1', [customerEmail]);
-    if (userResult.rows.length > 0) {
-      userId = userResult.rows[0].id;
-    }
-  }
-
-  if (!userId) {
-    console.warn('[LemonSqueezy] Unable to match user for subscription event:', {
-      lemonSubscriptionId,
-      lemonVariantId,
-      customerEmail,
-    });
-    return { success: false, reason: 'user_not_found' };
-  }
-
-  await upsertSubscriptionRecord({
-    userId,
-    tier,
-    status,
-    startDate,
-    endDate,
-    autoRenew,
-  });
-
-  return {
-    success: true,
-    userId,
-    tier,
-    status,
-    lemonSubscriptionId,
-  };
 }
 
 app.get('/api/paypal/webhook', (req, res) => {
@@ -282,42 +178,6 @@ app.post('/api/paypal/webhook', async (req, res) => {
   } catch (error) {
     console.error('[PayPal] Webhook processing failed:', error);
     return res.status(500).json({ error: 'Failed to process PayPal webhook' });
-  }
-});
-
-app.post('/api/lemonsqueezy/webhook', async (req, res) => {
-  try {
-    if (!lemonWebhookSecret) {
-      return res.status(503).json({ error: 'Webhook secret not configured' });
-    }
-
-    const signature = req.get('X-Signature');
-    const rawBody = req.rawBody ? req.rawBody.toString('utf8') : JSON.stringify(req.body || {});
-
-    if (!verifyLemonSignature(signature, rawBody)) {
-      return res.status(401).json({ error: 'Invalid signature' });
-    }
-
-    const eventName = req.body?.meta?.event_name;
-    if (!eventName) {
-      return res.status(400).json({ error: 'Missing event name' });
-    }
-
-    if (!LEMON_RELEVANT_EVENTS.has(eventName)) {
-      return res.json({ success: true, ignored: true });
-    }
-
-    const result = await handleSubscriptionEvent(req.body);
-
-    if (!result.success) {
-      return res.status(202).json({ success: false, reason: result.reason });
-    }
-
-    console.log(`[LemonSqueezy] Processed ${eventName} for user ${result.userId} -> ${result.tier}`);
-    res.json({ success: true });
-  } catch (error) {
-    console.error('[LemonSqueezy] Webhook processing failed:', error);
-    res.status(500).json({ error: 'Failed to process webhook' });
   }
 });
 
@@ -420,7 +280,7 @@ app.use(cors({
 app.use(express.json({
   verify: (req, res, buf) => {
     const url = req.originalUrl || '';
-    if (url.startsWith('/api/lemonsqueezy/webhook') || url.startsWith('/api/paypal/webhook')) {
+    if (url.startsWith('/api/paypal/webhook')) {
       req.rawBody = Buffer.from(buf);
     }
   },
@@ -455,42 +315,6 @@ const authLimiter = rateLimit({
   },
   standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
   legacyHeaders: false, // Disable the `X-RateLimit-*` headers
-});
-
-app.post('/api/lemonsqueezy/webhook', async (req, res) => {
-  try {
-    if (!lemonWebhookSecret) {
-      return res.status(503).json({ error: 'Webhook secret not configured' });
-    }
-
-    const signature = req.get('X-Signature');
-    const rawBody = req.rawBody ? req.rawBody.toString('utf8') : JSON.stringify(req.body || {});
-
-    if (!verifyLemonSignature(signature, rawBody)) {
-      return res.status(401).json({ error: 'Invalid signature' });
-    }
-
-    const eventName = req.body?.meta?.event_name;
-    if (!eventName) {
-      return res.status(400).json({ error: 'Missing event name' });
-    }
-
-    if (!LEMON_RELEVANT_EVENTS.has(eventName)) {
-      return res.json({ success: true, ignored: true });
-    }
-
-    const result = await handleSubscriptionEvent(req.body);
-
-    if (!result.success) {
-      return res.status(202).json({ success: false, reason: result.reason });
-    }
-
-    console.log(`[LemonSqueezy] Processed ${eventName} for user ${result.userId} -> ${result.tier}`);
-    res.json({ success: true });
-  } catch (error) {
-    console.error('[LemonSqueezy] Webhook processing failed:', error);
-    res.status(500).json({ error: 'Failed to process webhook' });
-  }
 });
 
 const authenticateModRequest = (req, res, next) => {
