@@ -16,18 +16,22 @@ const planConfig = [
 ];
 
 const planIdToMeta = {};
+const tierToDefaultMeta = {};
 planConfig.forEach(({ envKey, tier, interval }) => {
   const value = process.env[envKey];
   if (value) {
-    planIdToMeta[value] = { tier, interval, planId: value };
+    const meta = { tier, interval, planId: value };
+    planIdToMeta[value] = meta;
+    if (!tierToDefaultMeta[tier]) {
+      tierToDefaultMeta[tier] = meta;
+    }
   }
 });
 
 const PAYPAL_ENABLED = Boolean(
   PAYPAL_CLIENT_ID &&
   PAYPAL_CLIENT_SECRET &&
-  PAYPAL_WEBHOOK_ID &&
-  Object.keys(planIdToMeta).length > 0,
+  PAYPAL_WEBHOOK_ID,
 );
 
 let cachedToken = null;
@@ -135,10 +139,16 @@ function getTierForPlanId(planId) {
   return meta?.tier || null;
 }
 
+function getPlanMetaForTier(tier) {
+  if (!tier) return null;
+  return tierToDefaultMeta[String(tier).toLowerCase()] || null;
+}
+
 module.exports = {
   PAYPAL_ENABLED,
   PAYPAL_API_BASE,
   verifyPayPalWebhook,
   getTierForPlanId,
   getPlanMeta,
+  getPlanMetaForTier,
 };
