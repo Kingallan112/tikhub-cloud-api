@@ -468,6 +468,7 @@ app.post('/api/paypal/webhook', async (req, res) => {
   }
 
   const rawBody = req.rawBody ? req.rawBody.toString('utf8') : JSON.stringify(req.body || {});
+  const transmissionId = req.headers['paypal-transmission-id'];
   let payload = req.body;
   if (!payload || Object.keys(payload).length === 0) {
     try {
@@ -475,6 +476,14 @@ app.post('/api/paypal/webhook', async (req, res) => {
     } catch (error) {
       return res.status(400).json({ error: 'Invalid JSON payload' });
     }
+  }
+
+  if (transmissionId) {
+    console.log('[PayPal] Incoming webhook', {
+      transmissionId,
+      eventId: payload?.id,
+      eventType: payload?.event_type,
+    });
   }
 
   try {
