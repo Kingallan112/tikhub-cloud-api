@@ -285,6 +285,42 @@ app.post('/api/paypal/webhook', async (req, res) => {
   }
 });
 
+app.post('/api/lemonsqueezy/webhook', async (req, res) => {
+  try {
+    if (!lemonWebhookSecret) {
+      return res.status(503).json({ error: 'Webhook secret not configured' });
+    }
+
+    const signature = req.get('X-Signature');
+    const rawBody = req.rawBody ? req.rawBody.toString('utf8') : JSON.stringify(req.body || {});
+
+    if (!verifyLemonSignature(signature, rawBody)) {
+      return res.status(401).json({ error: 'Invalid signature' });
+    }
+
+    const eventName = req.body?.meta?.event_name;
+    if (!eventName) {
+      return res.status(400).json({ error: 'Missing event name' });
+    }
+
+    if (!LEMON_RELEVANT_EVENTS.has(eventName)) {
+      return res.json({ success: true, ignored: true });
+    }
+
+    const result = await handleSubscriptionEvent(req.body);
+
+    if (!result.success) {
+      return res.status(202).json({ success: false, reason: result.reason });
+    }
+
+    console.log(`[LemonSqueezy] Processed ${eventName} for user ${result.userId} -> ${result.tier}`);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('[LemonSqueezy] Webhook processing failed:', error);
+    res.status(500).json({ error: 'Failed to process webhook' });
+  }
+});
+
 async function handlePayPalSubscriptionEvent(eventPayload) {
   const resource = eventPayload?.resource || {};
   const eventType = eventPayload?.event_type || 'unknown';
