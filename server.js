@@ -130,57 +130,6 @@ async function upsertSubscriptionRecord({
   await pool.query(`UPDATE users SET plan = $2 WHERE id = $1`, [userId, tier]);
 }
 
-app.get('/api/paypal/webhook', (req, res) => {
-  if (!PAYPAL_ENABLED) {
-    return res.status(503).json({ success: false, error: 'PayPal not configured' });
-  }
-  return res.json({ success: true, message: 'PayPal webhook endpoint ready for POST requests only' });
-});
-
-app.post('/api/paypal/webhook', async (req, res) => {
-  if (!PAYPAL_ENABLED) {
-    return res.status(503).json({ error: 'PayPal not configured' });
-  }
-
-  const rawBody = req.rawBody ? req.rawBody.toString('utf8') : JSON.stringify(req.body || {});
-  let payload = req.body;
-  if (!payload || Object.keys(payload).length === 0) {
-    try {
-      payload = JSON.parse(rawBody || '{}');
-    } catch (error) {
-      return res.status(400).json({ error: 'Invalid JSON payload' });
-    }
-  }
-
-  try {
-    const verification = await verifyPayPalWebhook(req.headers, rawBody);
-    if (!verification.verified) {
-      console.warn('[PayPal] Webhook verification failed:', verification.reason || verification.verificationStatus);
-      return res.status(401).json({ error: 'Invalid signature' });
-    }
-
-    const eventType = payload?.event_type;
-    if (!eventType) {
-      return res.status(400).json({ error: 'Missing event type' });
-    }
-
-    if (!PAYPAL_RELEVANT_EVENTS.has(eventType)) {
-      return res.json({ success: true, ignored: true });
-    }
-
-    const result = await handlePayPalSubscriptionEvent(payload);
-    if (!result.success) {
-      return res.status(202).json({ success: false, reason: result.reason });
-    }
-
-    console.log(`[PayPal] Processed ${eventType} for user ${result.userId} -> ${result.tier}`);
-    return res.json({ success: true });
-  } catch (error) {
-    console.error('[PayPal] Webhook processing failed:', error);
-    return res.status(500).json({ error: 'Failed to process PayPal webhook' });
-  }
-});
-
 async function handlePayPalSubscriptionEvent(eventPayload) {
   const resource = eventPayload?.resource || {};
   const eventType = eventPayload?.event_type || 'unknown';
@@ -372,6 +321,57 @@ app.use('/api/', limiter);
 // Apply stricter limiter to authentication routes
 app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/register', authLimiter);
+
+app.get('/api/paypal/webhook', (req, res) => {
+  if (!PAYPAL_ENABLED) {
+    return res.status(503).json({ success: false, error: 'PayPal not configured' });
+  }
+  return res.json({ success: true, message: 'PayPal webhook endpoint ready for POST requests only' });
+});
+
+app.post('/api/paypal/webhook', async (req, res) => {
+  if (!PAYPAL_ENABLED) {
+    return res.status(503).json({ error: 'PayPal not configured' });
+  }
+
+  const rawBody = req.rawBody ? req.rawBody.toString('utf8') : JSON.stringify(req.body || {});
+  let payload = req.body;
+  if (!payload || Object.keys(payload).length === 0) {
+    try {
+      payload = JSON.parse(rawBody || '{}');
+    } catch (error) {
+      return res.status(400).json({ error: 'Invalid JSON payload' });
+    }
+  }
+
+  try {
+    const verification = await verifyPayPalWebhook(req.headers, rawBody);
+    if (!verification.verified) {
+      console.warn('[PayPal] Webhook verification failed:', verification.reason || verification.verificationStatus);
+      return res.status(401).json({ error: 'Invalid signature' });
+    }
+
+    const eventType = payload?.event_type;
+    if (!eventType) {
+      return res.status(400).json({ error: 'Missing event type' });
+    }
+
+    if (!PAYPAL_RELEVANT_EVENTS.has(eventType)) {
+      return res.json({ success: true, ignored: true });
+    }
+
+    const result = await handlePayPalSubscriptionEvent(payload);
+    if (!result.success) {
+      return res.status(202).json({ success: false, reason: result.reason });
+    }
+
+    console.log(`[PayPal] Processed ${eventType} for user ${result.userId} -> ${result.tier}`);
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('[PayPal] Webhook processing failed:', error);
+    return res.status(500).json({ error: 'Failed to process PayPal webhook' });
+  }
+});
 
 // Database connection (Render PostgreSQL)
 const pool = new Pool({
