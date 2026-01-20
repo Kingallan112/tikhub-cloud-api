@@ -478,13 +478,11 @@ app.post('/api/paypal/webhook', async (req, res) => {
     }
   }
 
-  if (transmissionId) {
-    console.log('[PayPal] Incoming webhook', {
-      transmissionId,
-      eventId: payload?.id,
-      eventType: payload?.event_type,
-    });
-  }
+  console.log('[PayPal] Incoming webhook', {
+    transmissionId: transmissionId || null,
+    eventId: payload?.id || null,
+    eventType: payload?.event_type || null,
+  });
 
   try {
     const verification = await verifyPayPalWebhook(req.headers, rawBody);
