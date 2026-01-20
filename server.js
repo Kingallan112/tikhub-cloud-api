@@ -213,6 +213,26 @@ async function handleSubscriptionEvent(payload) {
       lemonVariantId,
       customerEmail,
     });
+    return { success: false, reason: 'user_not_found' };
+  }
+
+  await upsertSubscriptionRecord({
+    userId,
+    tier,
+    status,
+    startDate,
+    endDate,
+    autoRenew,
+  });
+
+  return {
+    success: true,
+    userId,
+    tier,
+    status,
+    lemonSubscriptionId,
+  };
+}
 
 app.get('/api/paypal/webhook', (req, res) => {
   if (!PAYPAL_ENABLED) {
@@ -264,26 +284,6 @@ app.post('/api/paypal/webhook', async (req, res) => {
     return res.status(500).json({ error: 'Failed to process PayPal webhook' });
   }
 });
-    return { success: false, reason: 'user_not_found' };
-  }
-
-  await upsertSubscriptionRecord({
-    userId,
-    tier,
-    status,
-    startDate,
-    endDate,
-    autoRenew,
-  });
-
-  return {
-    success: true,
-    userId,
-    tier,
-    status,
-    lemonSubscriptionId,
-  };
-}
 
 async function handlePayPalSubscriptionEvent(eventPayload) {
   const resource = eventPayload?.resource || {};
