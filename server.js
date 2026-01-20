@@ -214,6 +214,13 @@ async function handleSubscriptionEvent(payload) {
       customerEmail,
     });
 
+app.get('/api/paypal/webhook', (req, res) => {
+  if (!PAYPAL_ENABLED) {
+    return res.status(503).json({ success: false, error: 'PayPal not configured' });
+  }
+  return res.json({ success: true, message: 'PayPal webhook endpoint ready for POST requests only' });
+});
+
 app.post('/api/paypal/webhook', async (req, res) => {
   if (!PAYPAL_ENABLED) {
     return res.status(503).json({ error: 'PayPal not configured' });
